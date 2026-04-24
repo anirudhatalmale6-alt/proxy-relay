@@ -1,6 +1,6 @@
 """
-ProxyRotator v5.1 - Instant Proxy Rotation for AdsPower
-Auto-detects open profiles. Rotate = update proxy + quick restart.
+ProxyRotator v5.2 - Proxy Rotation for AdsPower
+Auto-detects open profiles via multiple API methods.
 Place proxies.txt next to this .exe (format: host:port:user:pass)
 """
 
@@ -20,7 +20,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "5.1"
+VERSION = "5.2"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 
@@ -110,6 +110,16 @@ def api_post(path, data=None):
         return {'code': -1, 'msg': str(e)}
 
 
+def api_raw(path):
+    try:
+        url = API_BASE + path
+        req = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read().decode()
+    except Exception as e:
+        return f'ERROR: {e}'
+
+
 def stop_browser(user_id):
     for fn in [
         lambda: api_get(f'/api/v1/browser/stop?user_id={user_id}'),
@@ -125,27 +135,11 @@ def start_browser(user_id):
     return api_get(f'/api/v1/browser/start?user_id={user_id}')
 
 
-def get_active_user_ids():
-    result = set()
-    resp = api_get('/api/v1/browser/active')
-    if resp.get('code') == 0:
-        data = resp.get('data', {})
-        if isinstance(data, dict):
-            lst = data.get('list', [])
-            if isinstance(lst, list):
-                for item in lst:
-                    if isinstance(item, dict):
-                        uid = item.get('user_id', '')
-                        if uid:
-                            result.add(uid)
-    return result
-
-
 class ProxyRotatorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f'ProxyRotator v{VERSION}')
-        self.root.geometry('760x600')
+        self.root.geometry('760x620')
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
 
@@ -210,7 +204,7 @@ class ProxyRotatorApp:
         tf.pack(fill='x', padx=15, pady=(10, 5))
         tk.Label(tf, text='PROXY ROTATOR', font=('Segoe UI', 16, 'bold'),
                  fg='#e94560', bg='#1a1a2e').pack()
-        tk.Label(tf, text=f'v{VERSION} - Auto-detect profiles, quick rotate',
+        tk.Label(tf, text=f'v{VERSION} - Auto-detect + rotate',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
 
         cf = tk.Frame(self.root, bg='#1a1a2e')
@@ -252,7 +246,7 @@ class ProxyRotatorApp:
         self.search_btn.pack(side='left')
 
         info = tk.Label(self.root,
-            text='ROTATE = new proxy + quick restart  |  RESTORE = original proxy  |  X = remove from list',
+            text='ROTATE = new proxy + quick restart  |  RESTORE = original proxy  |  X = remove',
             font=('Segoe UI', 8), fg='#FFD700', bg='#0f3460', pady=3)
         info.pack(fill='x', padx=15, pady=(5, 0))
 
@@ -281,7 +275,7 @@ class ProxyRotatorApp:
         lf = tk.Frame(self.root, bg='#1a1a2e')
         lf.pack(fill='x', padx=15, pady=(0, 10))
         tk.Label(lf, text='Log', font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack(anchor='w')
-        self.log_text = tk.Text(lf, height=5, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
+        self.log_text = tk.Text(lf, height=8, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
                                 insertbackground='#44dd44', border=0, wrap='word', state='disabled')
         self.log_text.pack(fill='x', pady=2)
 
@@ -314,66 +308,72 @@ class ProxyRotatorApp:
             return
         self.scanning = True
         self.scan_btn.configure(state='disabled', text='Scanning...')
-        self._log('Scanning for open profiles...')
+        self._log('--- SCAN START (debug) ---')
 
         def do_scan():
-            active_ids = get_active_user_ids()
-            self.root.after(0, lambda: self._log(
-                f'Active browser API returned {len(active_ids)} profile(s)'))
-
-            if not active_ids:
-                self.root.after(0, lambda: self._log(
-                    'No active browsers found via /browser/active. '
-                    'Trying page-by-page scan...'))
-                active_ids = self._scan_page_by_page()
-
             found = 0
-            for uid in active_ids:
-                if uid in self.dashboard:
-                    continue
 
-                resp = api_get(f'/api/v1/user/list?page=1&page_size=100')
-                profile = None
-                if resp.get('code') == 0:
-                    for p in resp.get('data', {}).get('list', []):
-                        if p.get('user_id') == uid:
-                            profile = p
-                            break
+            # Method 1: /api/v1/browser/active (bulk)
+            raw1 = api_raw('/api/v1/browser/active')
+            self.root.after(0, lambda: self._log(f'[1] /browser/active RAW: {raw1[:300]}'))
 
-                if not profile:
-                    resp2 = api_get(f'/api/v1/user/list?user_id={uid}')
-                    if resp2.get('code') == 0:
-                        lst = resp2.get('data', {}).get('list', [])
-                        if lst:
-                            profile = lst[0]
+            try:
+                resp1 = json.loads(raw1)
+                if resp1.get('code') == 0:
+                    data = resp1.get('data', {})
+                    if isinstance(data, dict):
+                        lst = data.get('list', [])
+                        if isinstance(lst, list) and lst:
+                            for item in lst:
+                                uid = item.get('user_id', '') if isinstance(item, dict) else ''
+                                if uid and uid not in self.dashboard:
+                                    self._add_from_uid(uid)
+                                    found += 1
+            except Exception:
+                pass
 
-                if not profile:
-                    self.root.after(0, lambda u=uid: self._log(
-                        f'Active profile {u[:8]}... but could not get details'))
-                    continue
+            # Method 2: /api/v1/browser/local-active (some versions)
+            raw2 = api_raw('/api/v1/browser/local-active')
+            self.root.after(0, lambda: self._log(f'[2] /browser/local-active RAW: {raw2[:300]}'))
 
-                sn = str(profile.get('serial_number', ''))
-                proxy_cfg = profile.get('user_proxy_config', {})
-                ph = proxy_cfg.get('proxy_host', '')
-                pp = proxy_cfg.get('proxy_port', '')
-                orig_display = f'{ph}:{pp}' if ph else 'no proxy'
-
-                self.dashboard[uid] = {
-                    'serial': sn,
-                    'user_id': uid,
-                    'original_proxy': orig_display,
-                    'original_config': dict(proxy_cfg),
-                    'current_proxy': orig_display,
-                    'rotated': False,
-                }
-                found += 1
-                self.root.after(0, lambda s=sn: self._log(f'Found open: {s}'))
+            try:
+                resp2 = json.loads(raw2)
+                if resp2.get('code') == 0:
+                    data = resp2.get('data', {})
+                    if isinstance(data, dict):
+                        lst = data.get('list', [])
+                        if isinstance(lst, list) and lst:
+                            for item in lst:
+                                uid = item.get('user_id', '') if isinstance(item, dict) else ''
+                                if uid and uid not in self.dashboard:
+                                    self._add_from_uid(uid)
+                                    found += 1
+            except Exception:
+                pass
 
             if found > 0:
                 self._save_dashboard()
+                self.root.after(0, lambda: self._log(f'Found {found} open profile(s)!'))
+            else:
+                # Method 3: sample first profile to debug active check
+                resp3 = api_get('/api/v1/user/list?page=1&page_size=1')
+                if resp3.get('code') == 0:
+                    lst3 = resp3.get('data', {}).get('list', [])
+                    if lst3:
+                        sample_uid = lst3[0].get('user_id', '')
+                        sample_sn = lst3[0].get('serial_number', '')
 
-            self.root.after(0, lambda: self._log(
-                f'Scan done. Found {found} new profile(s).'))
+                        raw_a = api_raw(f'/api/v1/browser/active?user_id={sample_uid}')
+                        self.root.after(0, lambda: self._log(
+                            f'[3] Sample #{sample_sn} active check: {raw_a[:200]}'))
+
+                        raw_s = api_raw(f'/api/v1/browser/start?user_id={sample_uid}&open_tabs=0')
+                        self.root.after(0, lambda: self._log(
+                            f'[4] Sample #{sample_sn} start check: {raw_s[:200]}'))
+
+                self.root.after(0, lambda: self._log(
+                    'Scan found 0 profiles. Copy this log and send it to me.'))
+
             self.root.after(0, self._render_dashboard)
             self.root.after(0, lambda: self.scan_btn.configure(
                 state='normal', text='SCAN OPEN PROFILES'))
@@ -381,49 +381,51 @@ class ProxyRotatorApp:
 
         threading.Thread(target=do_scan, daemon=True).start()
 
-    def _scan_page_by_page(self):
-        active_ids = set()
-        page = 1
-        checked = 0
-        while True:
-            resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
-            if resp.get('code') != 0:
-                break
-            profiles = resp.get('data', {}).get('list', [])
-            if not profiles:
-                break
+    def _add_from_uid(self, uid):
+        resp = api_get(f'/api/v1/user/list?page=1&page_size=100')
+        profile = None
+        if resp.get('code') == 0:
+            for p in resp.get('data', {}).get('list', []):
+                if p.get('user_id') == uid:
+                    profile = p
+                    break
 
-            for p in profiles:
-                uid = p.get('user_id', '')
-                if not uid or uid in self.dashboard:
-                    continue
-                checked += 1
+        if not profile:
+            page = 1
+            while page <= 20:
+                resp2 = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                if resp2.get('code') != 0:
+                    break
+                lst = resp2.get('data', {}).get('list', [])
+                if not lst:
+                    break
+                for p in lst:
+                    if p.get('user_id') == uid:
+                        profile = p
+                        break
+                if profile:
+                    break
+                page += 1
 
-                chk = api_get(f'/api/v1/browser/active?user_id={uid}')
-                if chk.get('code') == 0:
-                    d = chk.get('data', {})
-                    if isinstance(d, dict):
-                        status = d.get('status', '')
-                        ws = d.get('ws', {})
-                        if status == 'Active' or (isinstance(ws, dict) and ws.get('puppeteer', '')):
-                            active_ids.add(uid)
-                            continue
+        if not profile:
+            self.root.after(0, lambda: self._log(f'Active uid {uid[:12]}.. but no profile details'))
+            return
 
-                chk2 = api_get(f'/api/v1/browser/local-active?user_id={uid}')
-                if chk2.get('code') == 0:
-                    d2 = chk2.get('data', {})
-                    if isinstance(d2, dict) and d2.get('status') == 'Active':
-                        active_ids.add(uid)
+        sn = str(profile.get('serial_number', ''))
+        proxy_cfg = profile.get('user_proxy_config', {})
+        ph = proxy_cfg.get('proxy_host', '')
+        pp = proxy_cfg.get('proxy_port', '')
+        orig_display = f'{ph}:{pp}' if ph else 'no proxy'
 
-                if checked % 25 == 0:
-                    self.root.after(0, lambda c=checked, f=len(active_ids):
-                        self.scan_btn.configure(text=f'Checked {c} ({f} open)'))
-
-            page += 1
-
-        self.root.after(0, lambda: self._log(
-            f'Page scan: checked {checked}, found {len(active_ids)} active'))
-        return active_ids
+        self.dashboard[uid] = {
+            'serial': sn,
+            'user_id': uid,
+            'original_proxy': orig_display,
+            'original_config': dict(proxy_cfg),
+            'current_proxy': orig_display,
+            'rotated': False,
+        }
+        self.root.after(0, lambda: self._log(f'Found open: #{sn}'))
 
     def _add_profile(self):
         raw = self.search_var.get().strip()
@@ -461,7 +463,7 @@ class ProxyRotatorApp:
                     'rotated': False,
                 }
                 self._save_dashboard()
-                self._log(f'{sn}: added to dashboard')
+                self._log(f'{sn}: added')
 
             self.root.after(0, self._render_dashboard)
             self.root.after(0, lambda: self.search_btn.configure(state='normal', text='ADD'))
@@ -476,8 +478,7 @@ class ProxyRotatorApp:
 
         if not self.dashboard:
             tk.Label(self.profiles_frame,
-                text='No profiles yet.\n\nClick "SCAN OPEN PROFILES" to auto-detect running profiles,\n'
-                     'or type a serial number and click ADD.',
+                text='No profiles yet.\n\nClick SCAN or type a serial number and click ADD.',
                 font=('Segoe UI', 10), fg='#888', bg='#16213e', pady=30).pack()
             return
 
@@ -577,18 +578,17 @@ class ProxyRotatorApp:
                 self.root.after(0, self._render_dashboard)
                 return
 
-            self.root.after(0, lambda: self._log(f'{serial}: proxy updated to {display}'))
+            self.root.after(0, lambda: self._log(f'{serial}: proxy set to {display}, restarting...'))
 
-            self.root.after(0, lambda: self._log(f'{serial}: restarting browser...'))
             stop_browser(user_id)
             time.sleep(0.5)
             start_resp = start_browser(user_id)
 
             if start_resp.get('code') == 0:
-                self.root.after(0, lambda: self._log(f'{serial}: rotated to {display} - browser reopened'))
+                self.root.after(0, lambda: self._log(f'{serial}: DONE - rotated to {display}'))
             else:
-                self.root.after(0, lambda: self._log(
-                    f'{serial}: proxy set to {display} (browser restart: {start_resp.get("msg", "?")})'))
+                msg = start_resp.get('msg', '?')
+                self.root.after(0, lambda: self._log(f'{serial}: proxy set, browser: {msg}'))
 
             self.dashboard[user_id]['current_proxy'] = display
             self.dashboard[user_id]['rotated'] = True
@@ -623,17 +623,17 @@ class ProxyRotatorApp:
                 self.root.after(0, self._render_dashboard)
                 return
 
-            self.root.after(0, lambda: self._log(f'{serial}: restoring original proxy...'))
+            self.root.after(0, lambda: self._log(f'{serial}: restoring, restarting...'))
 
             stop_browser(user_id)
             time.sleep(0.5)
             start_resp = start_browser(user_id)
 
             if start_resp.get('code') == 0:
-                self.root.after(0, lambda: self._log(f'{serial}: restored - browser reopened'))
+                self.root.after(0, lambda: self._log(f'{serial}: DONE - restored original'))
             else:
-                self.root.after(0, lambda: self._log(
-                    f'{serial}: proxy restored (browser: {start_resp.get("msg", "?")})'))
+                msg = start_resp.get('msg', '?')
+                self.root.after(0, lambda: self._log(f'{serial}: restored, browser: {msg}'))
 
             self.dashboard[user_id]['current_proxy'] = info.get('original_proxy', '?')
             self.dashboard[user_id]['rotated'] = False
