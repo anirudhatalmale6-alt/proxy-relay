@@ -1,9 +1,10 @@
 """
-ProxyRotator v2.0 - Per-Profile Proxy Rotation for AdsPower
+ProxyRotator v2.2 - Per-Profile Proxy Rotation for AdsPower
 Each profile gets its own ROTATE button.
 Uses AdsPower API to update proxy + restart browser.
 
 Place proxies.txt next to this .exe (format: host:port:user:pass)
+Requires AdsPower API Key (Settings > Security > API Key)
 """
 
 import tkinter as tk
@@ -22,8 +23,9 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.1"
+VERSION = "2.2"
 API_BASE = "http://127.0.0.1:50325"
+CONFIG_FILE = "proxyrotator.json"
 
 
 def get_app_dir():
@@ -34,6 +36,30 @@ def get_app_dir():
 
 def get_proxies_path():
     return os.path.join(get_app_dir(), 'proxies.txt')
+
+
+def get_config_path():
+    return os.path.join(get_app_dir(), CONFIG_FILE)
+
+
+def load_config():
+    path = get_config_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_config(cfg):
+    path = get_config_path()
+    try:
+        with open(path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f'Error saving config: {e}')
 
 
 def load_proxies_from_file(filepath):
@@ -64,8 +90,11 @@ def load_proxies_from_file(filepath):
     return proxies
 
 
-def api_get(path):
+def api_get(path, api_key=''):
     try:
+        if api_key:
+            sep = '&' if '?' in path else '?'
+            path = f'{path}{sep}api_key={api_key}'
         url = API_BASE + path
         req = urllib.request.Request(url, method='GET')
         req.add_header('Content-Type', 'application/json')
@@ -75,8 +104,11 @@ def api_get(path):
         return {'code': -1, 'msg': str(e)}
 
 
-def api_post(path, data=None):
+def api_post(path, data=None, api_key=''):
     try:
+        if api_key:
+            sep = '&' if '?' in path else '?'
+            path = f'{path}{sep}api_key={api_key}'
         url = API_BASE + path
         body = json.dumps(data or {}).encode('utf-8')
         req = urllib.request.Request(url, data=body, method='POST')
@@ -91,7 +123,7 @@ class ProxyRotatorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f'ProxyRotator v{VERSION}')
-        self.root.geometry('580x520')
+        self.root.geometry('580x560')
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
 
@@ -99,7 +131,9 @@ class ProxyRotatorApp:
         self.profiles = []
         self.profile_proxies = {}
         self.profile_widgets = {}
+        self.api_key = ''
 
+        self._load_config()
         self._load_proxies()
         self._build_ui()
         self._refresh_profiles()
@@ -115,6 +149,22 @@ class ProxyRotatorApp:
             self.log_text.insert('end', line + '\n')
             self.log_text.see('end')
             self.log_text.configure(state='disabled')
+
+    def _load_config(self):
+        cfg = load_config()
+        self.api_key = cfg.get('api_key', '')
+
+    def _save_api_key(self):
+        self.api_key = self.api_key_var.get().strip()
+        cfg = load_config()
+        cfg['api_key'] = self.api_key
+        save_config(cfg)
+        if self.api_key:
+            self._log(f'API key saved ({len(self.api_key)} chars)')
+            self.key_status.configure(text='Saved', fg='#44dd44')
+        else:
+            self._log('API key cleared')
+            self.key_status.configure(text='No key', fg='#ff6b6b')
 
     def _load_proxies(self):
         path = get_proxies_path()
@@ -132,6 +182,31 @@ class ProxyRotatorApp:
                  fg='#e94560', bg='#1a1a2e').pack()
         tk.Label(tf, text=f'v{VERSION} - Per-profile proxy rotation for AdsPower',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
+
+        # API Key row
+        kf = tk.Frame(self.root, bg='#1a1a2e')
+        kf.pack(fill='x', padx=15, pady=(5, 2))
+
+        tk.Label(kf, text='API Key:', font=('Segoe UI', 9, 'bold'),
+                 fg='#ddd', bg='#1a1a2e').pack(side='left')
+
+        self.api_key_var = tk.StringVar(value=self.api_key)
+        key_entry = tk.Entry(kf, textvariable=self.api_key_var, font=('Consolas', 9),
+                             bg='#0a0a1a', fg='#44dd44', insertbackground='#44dd44',
+                             border=1, relief='solid', width=30, show='*')
+        key_entry.pack(side='left', padx=(6, 4), fill='x', expand=True)
+
+        tk.Button(kf, text='Save', font=('Segoe UI', 8),
+                  fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
+                  cursor='hand2', command=self._save_api_key).pack(side='left', padx=2)
+
+        self.key_status = tk.Label(kf, font=('Segoe UI', 8, 'bold'), bg='#1a1a2e',
+                                    text='Saved' if self.api_key else 'No key',
+                                    fg='#44dd44' if self.api_key else '#ff6b6b')
+        self.key_status.pack(side='left', padx=4)
+
+        tk.Label(kf, text='(AdsPower > Settings > Security)',
+                 font=('Segoe UI', 7), fg='#666', bg='#1a1a2e').pack(side='right')
 
         # Proxy count + buttons
         cf = tk.Frame(self.root, bg='#1a1a2e')
@@ -198,6 +273,12 @@ class ProxyRotatorApp:
             self._log(f'No proxies.txt found at: {path}')
             self._log('Click "Load proxies.txt" or place the file next to this .exe')
 
+        if self.api_key:
+            self._log(f'API key loaded from config')
+        else:
+            self._log('No API key set - enter your AdsPower API key above')
+            self._log('Find it in: AdsPower > Settings > Security > API Key')
+
     def _browse_proxies(self):
         filepath = filedialog.askopenfilename(
             title='Select Proxy List',
@@ -214,10 +295,10 @@ class ProxyRotatorApp:
         def do_refresh():
             self._log('Fetching profiles from AdsPower...')
 
-            # Get all profiles via user/list (paginated)
             all_profiles = []
             for page in range(1, 50):
-                resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                resp = api_get(f'/api/v1/user/list?page={page}&page_size=100',
+                               api_key=self.api_key)
                 if resp.get('code') != 0:
                     if page == 1:
                         self._log(f'AdsPower API error: {resp.get("msg", "unknown")}')
@@ -315,6 +396,13 @@ class ProxyRotatorApp:
             messagebox.showwarning('No Proxies', 'Load proxies.txt first.')
             return
 
+        if not self.api_key:
+            self._log('No API key! Enter your AdsPower API key first.')
+            messagebox.showwarning('No API Key',
+                'Enter your AdsPower API Key first.\n\n'
+                'Find it in: AdsPower > Settings > Security > API Key')
+            return
+
         widgets = self.profile_widgets.get(user_id)
         if widgets:
             widgets['rotate_btn'].configure(state='disabled', text='...')
@@ -337,22 +425,27 @@ class ProxyRotatorApp:
             resp = api_post('/api/v1/user/update', {
                 'user_id': user_id,
                 'user_proxy_config': proxy_config
-            })
+            }, api_key=self.api_key)
 
             if resp.get('code') != 0:
-                self._log(f'Update failed: {resp.get("msg", "unknown")}')
+                msg = resp.get('msg', 'unknown')
+                self._log(f'Update failed: {msg}')
+                if 'permission' in msg.lower():
+                    self._log('Check your API key in AdsPower > Settings > Security')
                 self.root.after(0, lambda: self._update_profile_ui(user_id, 'FAILED', '#ff4444'))
                 return
 
             self._log(f'Proxy updated for {user_id}. Restarting browser...')
 
-            stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id})
+            stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id},
+                                 api_key=self.api_key)
             if stop_resp.get('code') != 0:
                 self._log(f'Stop warning: {stop_resp.get("msg", "")}')
 
             time.sleep(1.5)
 
-            start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}')
+            start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}',
+                                 api_key=self.api_key)
             if start_resp.get('code') == 0:
                 self._log(f'Profile {user_id} restarted with {display}')
                 self.root.after(0, lambda: self._update_profile_ui(user_id, display, '#44dd44'))
