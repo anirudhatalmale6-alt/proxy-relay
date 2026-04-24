@@ -130,37 +130,49 @@ class KernelChangerApp:
         def do_load():
             self.groups = {}
 
-            resp = api_get('/api/v1/group/list')
-            if resp.get('code') == 0:
+            page = 1
+            while True:
+                resp = api_get(f'/api/v1/group/list?page={page}&page_size=100')
+                if resp.get('code') != 0:
+                    break
                 grp_list = resp.get('data', {}).get('list', [])
                 if isinstance(resp.get('data'), list):
                     grp_list = resp['data']
+                if not grp_list:
+                    break
                 for g in grp_list:
                     gid = str(g.get('group_id', ''))
                     gname = g.get('group_name', f'Group {gid}')
                     if gid:
                         self.groups[gname] = gid
+                page += 1
+                time.sleep(0.3)
+
+            if self.groups:
                 self.root.after(0, lambda: self._log(
                     f'Loaded {len(self.groups)} group(s) from API'))
             else:
                 self.root.after(0, lambda: self._log(
-                    f'Group API: {resp.get("msg", "error")}. Scanning profiles for groups...'))
-                page = 1
-                while True:
-                    r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
-                    if r.get('code') != 0:
-                        break
-                    lst = r.get('data', {}).get('list', [])
-                    if not lst:
-                        break
-                    for p in lst:
-                        gid = str(p.get('group_id', '0'))
-                        gname = p.get('group_name', f'Group {gid}')
-                        if gname and gid and gname not in self.groups:
-                            self.groups[gname] = gid
-                    page += 1
-                self.root.after(0, lambda: self._log(
-                    f'Found {len(self.groups)} group(s) from profiles'))
+                    'Group API empty. Scanning profiles for groups...'))
+
+            page = 1
+            while True:
+                r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                if r.get('code') != 0:
+                    break
+                lst = r.get('data', {}).get('list', [])
+                if not lst:
+                    break
+                for p in lst:
+                    gid = str(p.get('group_id', '0'))
+                    gname = p.get('group_name', '')
+                    if gname and gid and gname not in self.groups:
+                        self.groups[gname] = gid
+                page += 1
+                time.sleep(0.3)
+
+            self.root.after(0, lambda: self._log(
+                f'Total: {len(self.groups)} folder(s) found'))
 
             self.root.after(0, self._update_group_menu)
 
