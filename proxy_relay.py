@@ -23,7 +23,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.6"
+VERSION = "2.7"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 
@@ -501,18 +501,43 @@ class ProxyRotatorApp:
             self._log(f'Success via {method}!')
 
             if method.startswith('update'):
-                self._log(f'Proxy updated. Restarting browser...')
-                stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id},
-                                     api_key=self.api_key)
-                if stop_resp.get('code') != 0:
-                    self._log(f'Stop warning: {stop_resp.get("msg", "")}')
-                time.sleep(1.5)
-                start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}',
-                                     api_key=self.api_key)
+                self._log(f'Proxy updated. Closing browser...')
+                stopped = False
+                for stop_method in [
+                    lambda: api_get(f'/api/v1/browser/stop?user_id={user_id}'),
+                    lambda: api_post('/api/v1/browser/stop', {'user_id': user_id}),
+                    lambda: api_get(f'/api/v1/browser/stop?user_id={user_id}',
+                                     api_key=self.api_key),
+                    lambda: api_post('/api/v1/browser/stop', {'user_id': user_id},
+                                     api_key=self.api_key),
+                ]:
+                    resp = stop_method()
+                    if resp.get('code') == 0:
+                        self._log('Browser stopped')
+                        stopped = True
+                        break
+
+                if not stopped:
+                    self._log('Could not stop browser automatically')
+                    self._log('Please close the profile manually in AdsPower, then reopen it')
+                    self.root.after(0, lambda: self._update_profile_ui(
+                        user_id, f'{display} (close & reopen)', '#FFD700'))
+                    return
+
+                time.sleep(2)
+                self._log('Reopening browser...')
+                start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}')
+                if start_resp.get('code') != 0:
+                    start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}',
+                                         api_key=self.api_key)
                 if start_resp.get('code') == 0:
                     self._log(f'Profile {user_id} restarted with {display}')
                 else:
-                    self._log(f'Browser restart failed - restart manually')
+                    self._log(f'Reopen failed - open profile manually in AdsPower')
+                    self._log(f'Proxy IS updated to {display}')
+                    self.root.after(0, lambda: self._update_profile_ui(
+                        user_id, f'{display} (reopen manually)', '#FFD700'))
+                    return
             else:
                 self._log(f'Profile {user_id} started with {display}')
 
