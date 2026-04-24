@@ -1,8 +1,6 @@
 """
-ProxyRotator v4.1 - Instant Proxy Rotation for AdsPower
-Uses local proxy relay - zero browser restart needed.
-Add profiles before opening them, then rotate instantly.
-
+ProxyRotator v5.0 - Instant Proxy Rotation for AdsPower
+Auto-detects open profiles. Rotate via API - no relay, no restart.
 Place proxies.txt next to this .exe (format: host:port:user:pass)
 """
 
@@ -14,9 +12,6 @@ import os
 import sys
 import random
 import time
-import socket
-import base64
-import select
 
 try:
     import urllib.request
@@ -25,10 +20,9 @@ try:
 except ImportError:
     pass
 
-VERSION = "4.1"
+VERSION = "5.0"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
-BASE_PORT = 10100
 
 
 def get_app_dir():
@@ -116,138 +110,41 @@ def api_post(path, data=None):
         return {'code': -1, 'msg': str(e)}
 
 
-def restart_browser(user_id):
-    for stop_fn in [
-        lambda: api_get(f'/api/v1/browser/stop?user_id={user_id}'),
-        lambda: api_post('/api/v1/browser/stop', {'user_id': user_id}),
-    ]:
-        r = stop_fn()
-        if r.get('code') == 0:
+def fetch_open_profiles():
+    page = 1
+    all_open = []
+    while True:
+        resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+        if resp.get('code') != 0:
             break
-    time.sleep(1)
-    return api_get(f'/api/v1/browser/start?user_id={user_id}')
-
-
-class RelayProxy:
-    def __init__(self, port):
-        self.port = port
-        self.upstream_host = ''
-        self.upstream_port = 0
-        self.upstream_user = ''
-        self.upstream_pass = ''
-        self.server_socket = None
-        self.running = False
-
-    def set_upstream(self, host, port, user='', password=''):
-        self.upstream_host = host
-        self.upstream_port = int(port)
-        self.upstream_user = user
-        self.upstream_pass = password
-
-    def start(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.settimeout(1)
-        self.server_socket.bind(('127.0.0.1', self.port))
-        self.server_socket.listen(50)
-        self.running = True
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-
-    def stop(self):
-        self.running = False
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
-
-    def _accept_loop(self):
-        while self.running:
-            try:
-                client, addr = self.server_socket.accept()
-                client.settimeout(30)
-                threading.Thread(target=self._handle, args=(client,), daemon=True).start()
-            except socket.timeout:
-                continue
-            except Exception:
-                if self.running:
-                    continue
-                break
-
-    def _handle(self, client):
-        proxy_sock = None
-        try:
-            data = b''
-            while b'\r\n' not in data:
-                chunk = client.recv(8192)
-                if not chunk:
-                    return
-                data += chunk
-
-            if not self.upstream_host:
-                client.close()
-                return
-
-            proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            proxy_sock.settimeout(15)
-            proxy_sock.connect((self.upstream_host, self.upstream_port))
-
-            if self.upstream_user:
-                creds = f'{self.upstream_user}:{self.upstream_pass}'
-                auth = base64.b64encode(creds.encode()).decode()
-                auth_line = f'Proxy-Authorization: Basic {auth}\r\n'.encode()
-                idx = data.find(b'\r\n') + 2
-                data = data[:idx] + auth_line + data[idx:]
-
-            proxy_sock.sendall(data)
-
-            self._relay(client, proxy_sock)
-        except Exception:
-            pass
-        finally:
-            for s in [client, proxy_sock]:
-                if s:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-
-    def _relay(self, s1, s2):
-        sockets = [s1, s2]
-        try:
-            while True:
-                readable, _, errored = select.select(sockets, [], sockets, 30)
-                if errored:
-                    break
-                if not readable:
-                    break
-                for s in readable:
-                    data = s.recv(65536)
-                    if not data:
-                        return
-                    dst = s2 if s is s1 else s1
-                    dst.sendall(data)
-        except Exception:
-            pass
+        profiles = resp.get('data', {}).get('list', [])
+        if not profiles:
+            break
+        for p in profiles:
+            uid = p.get('user_id', '')
+            active = api_get(f'/api/v1/browser/active?user_id={uid}')
+            if active.get('code') == 0 and active.get('data', {}).get('status') == 'Active':
+                all_open.append(p)
+        page += 1
+    return all_open
 
 
 class ProxyRotatorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f'ProxyRotator v{VERSION}')
-        self.root.geometry('720x560')
+        self.root.geometry('750x580')
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
 
         self.proxies = []
         self.profile_widgets = {}
         self.dashboard = {}
-        self.relay_servers = {}
+        self.scanning = False
 
         self._load_config_data()
         self._auto_load_proxies()
         self._build_ui()
-        self._start_existing_relays()
 
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
@@ -296,48 +193,12 @@ class ProxyRotatorApp:
         except Exception:
             pass
 
-    def _next_port(self):
-        used = set()
-        for info in self.dashboard.values():
-            p = info.get('relay_port', 0)
-            if p:
-                used.add(p)
-        port = BASE_PORT
-        while port in used:
-            port += 1
-        return port
-
-    def _start_existing_relays(self):
-        for uid, info in self.dashboard.items():
-            port = info.get('relay_port')
-            if not port:
-                continue
-            relay = RelayProxy(port)
-
-            if info.get('rotated') and info.get('rotated_config'):
-                rc = info['rotated_config']
-                relay.set_upstream(rc.get('host', ''), rc.get('port', 0),
-                                   rc.get('username', ''), rc.get('password', ''))
-            elif info.get('original_config'):
-                oc = info['original_config']
-                relay.set_upstream(oc.get('proxy_host', ''), oc.get('proxy_port', 0),
-                                   oc.get('proxy_user', ''), oc.get('proxy_password', ''))
-
-            try:
-                relay.start()
-                self.relay_servers[uid] = relay
-            except Exception as e:
-                print(f'Failed to start relay on port {port}: {e}')
-
-        if self.relay_servers:
-            self._log(f'Started {len(self.relay_servers)} relay proxy(s)')
-
     def _build_ui(self):
         tf = tk.Frame(self.root, bg='#1a1a2e')
         tf.pack(fill='x', padx=15, pady=(10, 5))
         tk.Label(tf, text='PROXY ROTATOR', font=('Segoe UI', 16, 'bold'),
                  fg='#e94560', bg='#1a1a2e').pack()
-        tk.Label(tf, text=f'v{VERSION} - Instant rotation, zero restart',
+        tk.Label(tf, text=f'v{VERSION} - Auto-detect open profiles, instant rotation',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
 
         cf = tk.Frame(self.root, bg='#1a1a2e')
@@ -356,33 +217,36 @@ class ProxyRotatorApp:
         sf = tk.Frame(self.root, bg='#1a1a2e')
         sf.pack(fill='x', padx=15, pady=(5, 2))
 
-        tk.Label(sf, text='Add Profile:', font=('Segoe UI', 10, 'bold'),
-                 fg='#FFD700', bg='#1a1a2e').pack(side='left')
+        self.scan_btn = tk.Button(sf, text='SCAN OPEN PROFILES', font=('Segoe UI', 10, 'bold'),
+                  fg='#fff', bg='#e94560', activebackground='#ff6b8a',
+                  border=0, padx=16, pady=4,
+                  cursor='hand2', command=self._scan_profiles)
+        self.scan_btn.pack(side='left')
+
+        tk.Label(sf, text='or add serial #:', font=('Segoe UI', 9),
+                 fg='#888', bg='#1a1a2e').pack(side='left', padx=(12, 4))
 
         self.search_var = tk.StringVar()
-        self.search_entry = tk.Entry(sf, textvariable=self.search_var, font=('Consolas', 12),
+        self.search_entry = tk.Entry(sf, textvariable=self.search_var, font=('Consolas', 11),
                                 bg='#0a0a1a', fg='#FFD700', insertbackground='#FFD700',
-                                border=1, relief='solid', width=20)
-        self.search_entry.pack(side='left', padx=(6, 4))
+                                border=1, relief='solid', width=12)
+        self.search_entry.pack(side='left', padx=(0, 4))
         self.search_entry.bind('<Return>', lambda e: self._add_profile())
 
         self.search_btn = tk.Button(sf, text='ADD', font=('Segoe UI', 9, 'bold'),
                   fg='#fff', bg='#FF9800', activebackground='#FFB74D',
-                  border=0, padx=12, pady=3,
+                  border=0, padx=10, pady=3,
                   cursor='hand2', command=self._add_profile)
-        self.search_btn.pack(side='left', padx=4)
-
-        tk.Label(sf, text='serial # (no restart)',
-                 font=('Segoe UI', 8), fg='#666', bg='#1a1a2e').pack(side='left', padx=4)
+        self.search_btn.pack(side='left')
 
         info = tk.Label(self.root,
-            text='ADD profiles before opening them  |  ROTATE = instant  |  RESTORE = original  |  X = remove',
+            text='ROTATE = change proxy (no restart)  |  RESTORE = back to original  |  X = remove from list',
             font=('Segoe UI', 8), fg='#FFD700', bg='#0f3460', pady=3)
         info.pack(fill='x', padx=15, pady=(5, 0))
 
         hf = tk.Frame(self.root, bg='#16213e')
         hf.pack(fill='x', padx=15, pady=(0, 0))
-        for text, w in [('Serial', 7), ('Original', 15), ('Active Proxy', 15), ('Status', 10), ('', 24)]:
+        for text, w in [('Serial', 7), ('Original Proxy', 18), ('Active Proxy', 18), ('Status', 8), ('', 20)]:
             tk.Label(hf, text=text, font=('Segoe UI', 8, 'bold'), fg='#aaa',
                      bg='#16213e', width=w, anchor='w').pack(side='left', padx=(4 if text == 'Serial' else 0, 0))
 
@@ -405,7 +269,7 @@ class ProxyRotatorApp:
         lf = tk.Frame(self.root, bg='#1a1a2e')
         lf.pack(fill='x', padx=15, pady=(0, 10))
         tk.Label(lf, text='Log', font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack(anchor='w')
-        self.log_text = tk.Text(lf, height=3, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
+        self.log_text = tk.Text(lf, height=4, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
                                 insertbackground='#44dd44', border=0, wrap='word', state='disabled')
         self.log_text.pack(fill='x', pady=2)
 
@@ -413,6 +277,9 @@ class ProxyRotatorApp:
             self._log(f'Loaded {len(self.proxies)} proxies')
         else:
             self._log('No proxies found. Click "Load proxies.txt"')
+
+        if self.dashboard:
+            self._log(f'{len(self.dashboard)} profile(s) from last session')
 
         self._render_dashboard()
 
@@ -429,6 +296,66 @@ class ProxyRotatorApp:
                 text=f'Proxies: {len(self.proxies)}',
                 fg='#44dd44' if self.proxies else '#ff6b6b')
             self._log(f'Loaded {len(self.proxies)} proxies')
+
+    def _scan_profiles(self):
+        if self.scanning:
+            return
+        self.scanning = True
+        self.scan_btn.configure(state='disabled', text='Scanning...')
+        self._log('Scanning for open profiles...')
+
+        def do_scan():
+            page = 1
+            found = 0
+            checked = 0
+            while True:
+                resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                if resp.get('code') != 0:
+                    break
+                profiles = resp.get('data', {}).get('list', [])
+                if not profiles:
+                    break
+
+                for p in profiles:
+                    uid = p.get('user_id', '')
+                    sn = str(p.get('serial_number', ''))
+                    checked += 1
+
+                    if uid in self.dashboard:
+                        continue
+
+                    active = api_get(f'/api/v1/browser/active?user_id={uid}')
+                    if active.get('code') == 0 and active.get('data', {}).get('status') == 'Active':
+                        proxy_cfg = p.get('user_proxy_config', {})
+                        ph = proxy_cfg.get('proxy_host', '')
+                        pp = proxy_cfg.get('proxy_port', '')
+                        orig_display = f'{ph}:{pp}' if ph else 'no proxy'
+
+                        self.dashboard[uid] = {
+                            'serial': sn,
+                            'user_id': uid,
+                            'original_proxy': orig_display,
+                            'original_config': dict(proxy_cfg),
+                            'current_proxy': orig_display,
+                            'rotated': False,
+                        }
+                        found += 1
+                        self.root.after(0, lambda s=sn: self._log(f'Found open: {s}'))
+
+                    if checked % 20 == 0:
+                        self.root.after(0, lambda c=checked: self.scan_btn.configure(
+                            text=f'Checking... ({c})'))
+
+                page += 1
+
+            if found > 0:
+                self._save_dashboard()
+            self.root.after(0, lambda: self._log(f'Scan done. Found {found} new open profile(s). Checked {checked} total.'))
+            self.root.after(0, self._render_dashboard)
+            self.root.after(0, lambda: self.scan_btn.configure(state='normal', text='SCAN OPEN PROFILES'))
+            self.scanning = False
+
+        threading.Thread(target=do_scan, daemon=True).start()
 
     def _add_profile(self):
         raw = self.search_var.get().strip()
@@ -449,8 +376,7 @@ class ProxyRotatorApp:
                     self._log(f'Profile {serial} not found')
                     continue
 
-                profiles = resp['data']['list']
-                p = profiles[0]
+                p = resp['data']['list'][0]
                 uid = p.get('user_id', '')
                 sn = str(p.get('serial_number', ''))
                 proxy_cfg = p.get('user_proxy_config', {})
@@ -458,61 +384,16 @@ class ProxyRotatorApp:
                 pp = proxy_cfg.get('proxy_port', '')
                 orig_display = f'{ph}:{pp}' if ph else 'no proxy'
 
-                port = self._next_port()
-
-                relay = RelayProxy(port)
-                if ph:
-                    relay.set_upstream(ph, pp,
-                                       proxy_cfg.get('proxy_user', ''),
-                                       proxy_cfg.get('proxy_password', ''))
-                try:
-                    relay.start()
-                except Exception as e:
-                    self._log(f'Failed to start relay on port {port}: {e}')
-                    continue
-
-                self.relay_servers[uid] = relay
-
-                local_proxy = {
-                    'proxy_soft': 'other',
-                    'proxy_type': 'http',
-                    'proxy_host': '127.0.0.1',
-                    'proxy_port': str(port),
-                    'proxy_user': '',
-                    'proxy_password': ''
-                }
-
-                resp2 = api_post('/api/v1/user/update', {
-                    'user_id': uid,
-                    'user_proxy_config': local_proxy
-                })
-
-                if resp2.get('code') != 0:
-                    self._log(f'{sn}: failed to set local proxy - {resp2.get("msg", "")}')
-                    relay.stop()
-                    del self.relay_servers[uid]
-                    continue
-
                 self.dashboard[uid] = {
                     'serial': sn,
                     'user_id': uid,
                     'original_proxy': orig_display,
                     'original_config': dict(proxy_cfg),
                     'current_proxy': orig_display,
-                    'relay_port': port,
                     'rotated': False,
-                    'rotated_config': None
                 }
                 self._save_dashboard()
-
-                active = api_get(f'/api/v1/browser/active?user_id={uid}')
-                is_running = (active.get('code') == 0 and
-                              active.get('data', {}).get('status') == 'Active')
-
-                if is_running:
-                    self._log(f'{sn}: relay ready on port {port}. Close & reopen profile to activate.')
-                else:
-                    self._log(f'{sn}: relay ready on port {port}. Open profile normally - rotation will be instant.')
+                self._log(f'{sn}: added to dashboard')
 
             self.root.after(0, self._render_dashboard)
             self.root.after(0, lambda: self.search_btn.configure(state='normal', text='ADD'))
@@ -527,8 +408,8 @@ class ProxyRotatorApp:
 
         if not self.dashboard:
             tk.Label(self.profiles_frame,
-                text='No profiles added yet.\n\nAdd serial numbers BEFORE opening profiles.\n'
-                     'Then open normally in AdsPower - rotations will be instant.',
+                text='No profiles yet.\n\nClick "SCAN OPEN PROFILES" to auto-detect running profiles,\n'
+                     'or type a serial number and click ADD.',
                 font=('Segoe UI', 10), fg='#888', bg='#16213e', pady=30).pack()
             return
 
@@ -541,23 +422,23 @@ class ProxyRotatorApp:
                      fg='#ddd', bg=bg, width=7, anchor='w').pack(side='left', padx=(6, 0))
 
             orig = info.get('original_proxy', '?')
-            if len(orig) > 15:
-                orig = orig[:15] + '..'
+            if len(orig) > 18:
+                orig = orig[:18] + '..'
             tk.Label(row, text=orig, font=('Consolas', 8), fg='#8888aa',
-                     bg=bg, width=15, anchor='w').pack(side='left')
+                     bg=bg, width=18, anchor='w').pack(side='left')
 
             cur = info.get('current_proxy', '?')
-            if len(cur) > 15:
-                cur = cur[:15] + '..'
+            if len(cur) > 18:
+                cur = cur[:18] + '..'
             cur_color = '#FF9800' if info.get('rotated') else '#44dd44'
             cur_lbl = tk.Label(row, text=cur, font=('Consolas', 8, 'bold'),
-                               fg=cur_color, bg=bg, width=15, anchor='w')
+                               fg=cur_color, bg=bg, width=18, anchor='w')
             cur_lbl.pack(side='left')
 
             status = 'ROTATED' if info.get('rotated') else 'ready'
             st_color = '#FF9800' if info.get('rotated') else '#44dd44'
             status_lbl = tk.Label(row, text=status, font=('Consolas', 8, 'bold'),
-                                   fg=st_color, bg=bg, width=10, anchor='w')
+                                   fg=st_color, bg=bg, width=8, anchor='w')
             status_lbl.pack(side='left')
 
             remove_btn = tk.Button(row, text='X', font=('Segoe UI', 7, 'bold'),
@@ -594,100 +475,98 @@ class ProxyRotatorApp:
             messagebox.showwarning('No Proxies', 'Load proxies.txt first.')
             return
 
-        relay = self.relay_servers.get(user_id)
-        if not relay:
-            self._log('Relay not running for this profile')
+        info = self.dashboard.get(user_id)
+        if not info:
             return
 
+        serial = info.get('serial', '?')
         proxy = random.choice(self.proxies)
         display = f"{proxy['host']}:{proxy['port']}"
-        serial = self.dashboard.get(user_id, {}).get('serial', '?')
 
-        relay.set_upstream(proxy['host'], proxy['port'],
-                           proxy.get('username', ''), proxy.get('password', ''))
+        def do_rotate():
+            new_proxy_cfg = {
+                'proxy_soft': 'other',
+                'proxy_type': 'http',
+                'proxy_host': proxy['host'],
+                'proxy_port': str(proxy['port']),
+                'proxy_user': proxy.get('username', ''),
+                'proxy_password': proxy.get('password', '')
+            }
 
-        if user_id in self.dashboard:
-            self.dashboard[user_id]['current_proxy'] = display
-            self.dashboard[user_id]['rotated'] = True
-            self.dashboard[user_id]['rotated_config'] = dict(proxy)
-            self._save_dashboard()
+            resp = api_post('/api/v1/user/update', {
+                'user_id': user_id,
+                'user_proxy_config': new_proxy_cfg
+            })
 
-        self._log(f'{serial}: rotated to {display} (instant)')
-        self._render_dashboard()
+            if resp.get('code') == 0:
+                self.dashboard[user_id]['current_proxy'] = display
+                self.dashboard[user_id]['rotated'] = True
+                self.dashboard[user_id]['rotated_proxy'] = dict(proxy)
+                self._save_dashboard()
+                self.root.after(0, lambda: self._log(f'{serial}: rotated to {display}'))
+            else:
+                self.root.after(0, lambda: self._log(f'{serial}: FAILED - {resp.get("msg", "unknown error")}'))
+
+            self.root.after(0, self._render_dashboard)
+
+        threading.Thread(target=do_rotate, daemon=True).start()
 
     def _restore_profile(self, user_id):
         info = self.dashboard.get(user_id)
         if not info:
             return
 
-        relay = self.relay_servers.get(user_id)
-        if not relay:
-            self._log('Relay not running')
-            return
-
-        orig_cfg = info.get('original_config', {})
         serial = info.get('serial', '?')
+        orig_cfg = info.get('original_config', {})
 
-        relay.set_upstream(
-            orig_cfg.get('proxy_host', ''),
-            orig_cfg.get('proxy_port', 0),
-            orig_cfg.get('proxy_user', ''),
-            orig_cfg.get('proxy_password', '')
-        )
+        def do_restore():
+            resp = api_post('/api/v1/user/update', {
+                'user_id': user_id,
+                'user_proxy_config': orig_cfg
+            })
 
-        if user_id in self.dashboard:
-            self.dashboard[user_id]['current_proxy'] = info.get('original_proxy', '?')
-            self.dashboard[user_id]['rotated'] = False
-            self.dashboard[user_id]['rotated_config'] = None
-            self._save_dashboard()
+            if resp.get('code') == 0:
+                self.dashboard[user_id]['current_proxy'] = info.get('original_proxy', '?')
+                self.dashboard[user_id]['rotated'] = False
+                self.dashboard[user_id].pop('rotated_proxy', None)
+                self._save_dashboard()
+                self.root.after(0, lambda: self._log(f'{serial}: restored to original'))
+            else:
+                self.root.after(0, lambda: self._log(f'{serial}: restore FAILED - {resp.get("msg", "")}'))
 
-        self._log(f'{serial}: restored to original (instant)')
-        self._render_dashboard()
+            self.root.after(0, self._render_dashboard)
+
+        threading.Thread(target=do_restore, daemon=True).start()
 
     def _remove_profile(self, user_id):
         info = self.dashboard.get(user_id, {})
         serial = info.get('serial', '?')
 
-        def do_remove():
+        if info.get('rotated'):
             orig_cfg = info.get('original_config')
             if orig_cfg:
-                self._log(f'{serial}: restoring original proxy in AdsPower...')
                 api_post('/api/v1/user/update', {
                     'user_id': user_id,
                     'user_proxy_config': orig_cfg
                 })
 
-            relay = self.relay_servers.pop(user_id, None)
-            if relay:
-                relay.stop()
-
-            self.dashboard.pop(user_id, None)
-            self._save_dashboard()
-
-            if orig_cfg:
-                self._log(f'{serial}: restarting with original proxy...')
-                restart_browser(user_id)
-
-            self._log(f'{serial}: removed')
-            self.root.after(0, self._render_dashboard)
-
-        threading.Thread(target=do_remove, daemon=True).start()
+        self.dashboard.pop(user_id, None)
+        self._save_dashboard()
+        self._log(f'{serial}: removed')
+        self._render_dashboard()
 
     def _on_close(self):
         for uid, info in list(self.dashboard.items()):
-            orig_cfg = info.get('original_config')
-            if orig_cfg:
-                try:
-                    api_post('/api/v1/user/update', {
-                        'user_id': uid,
-                        'user_proxy_config': orig_cfg
-                    })
-                except Exception:
-                    pass
-
-        for relay in self.relay_servers.values():
-            relay.stop()
-
+            if info.get('rotated'):
+                orig_cfg = info.get('original_config')
+                if orig_cfg:
+                    try:
+                        api_post('/api/v1/user/update', {
+                            'user_id': uid,
+                            'user_proxy_config': orig_cfg
+                        })
+                    except Exception:
+                        pass
         self.root.destroy()
 
     def run(self):
