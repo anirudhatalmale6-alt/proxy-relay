@@ -132,7 +132,16 @@ class KernelChangerApp:
 
             page = 1
             while True:
-                resp = api_get(f'/api/v1/group/list?page={page}&page_size=100')
+                resp = None
+                for attempt in range(3):
+                    resp = api_get(f'/api/v1/group/list?page={page}&page_size=100')
+                    if resp.get('code') == 0:
+                        break
+                    if 'Too many request' in resp.get('msg', ''):
+                        time.sleep(1.5)
+                    else:
+                        break
+
                 if resp.get('code') != 0:
                     break
                 grp_list = resp.get('data', {}).get('list', [])
@@ -145,8 +154,10 @@ class KernelChangerApp:
                     gname = g.get('group_name', f'Group {gid}')
                     if gid:
                         self.groups[gname] = gid
+                self.root.after(0, lambda c=len(self.groups): self._log(
+                    f'Loading folders... {c} so far'))
                 page += 1
-                time.sleep(0.3)
+                time.sleep(0.5)
 
             if self.groups:
                 self.root.after(0, lambda: self._log(
@@ -157,7 +168,16 @@ class KernelChangerApp:
 
             page = 1
             while True:
-                r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                r = None
+                for attempt in range(3):
+                    r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                    if r.get('code') == 0:
+                        break
+                    if 'Too many request' in r.get('msg', ''):
+                        time.sleep(1.5)
+                    else:
+                        break
+
                 if r.get('code') != 0:
                     break
                 lst = r.get('data', {}).get('list', [])
@@ -169,7 +189,7 @@ class KernelChangerApp:
                     if gname and gid and gname not in self.groups:
                         self.groups[gname] = gid
                 page += 1
-                time.sleep(0.3)
+                time.sleep(0.5)
 
             self.root.after(0, lambda: self._log(
                 f'Total: {len(self.groups)} folder(s) found'))
