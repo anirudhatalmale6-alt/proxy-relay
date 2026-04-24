@@ -1,6 +1,6 @@
 """
 ProxyRotator v2.5 - Per-Profile Proxy Rotation for AdsPower
-Search by serial number - queries AdsPower API directly.
+Search by serial number. Tries multiple methods to rotate proxy.
 Each profile gets its own ROTATE button.
 
 Place proxies.txt next to this .exe (format: host:port:user:pass)
@@ -23,7 +23,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.5"
+VERSION = "2.6"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 
@@ -407,17 +407,68 @@ class ProxyRotatorApp:
 
         self.canvas.configure(scrollregion=self.canvas.bbox('all'))
 
+    def _try_update_proxy(self, user_id, proxy_config):
+        self._log('Method 1: user/update without API key...')
+        resp = api_post('/api/v1/user/update', {
+            'user_id': user_id,
+            'user_proxy_config': proxy_config
+        })
+        if resp.get('code') == 0:
+            return True, 'update_no_key'
+
+        self._log(f'Method 1 failed: {resp.get("msg", "")}')
+
+        if self.api_key:
+            self._log('Method 2: user/update with API key...')
+            resp = api_post('/api/v1/user/update', {
+                'user_id': user_id,
+                'user_proxy_config': proxy_config
+            }, api_key=self.api_key)
+            if resp.get('code') == 0:
+                return True, 'update_with_key'
+            self._log(f'Method 2 failed: {resp.get("msg", "")}')
+
+        self._log('Method 3: stop + start with proxy config...')
+        stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id},
+                             api_key=self.api_key)
+        self._log(f'Stop: {stop_resp.get("msg", "ok") if stop_resp.get("code") != 0 else "ok"}')
+        time.sleep(1.5)
+
+        proxy_json = json.dumps(proxy_config)
+        encoded = urllib.parse.quote(proxy_json)
+        start_resp = api_get(
+            f'/api/v1/browser/start?user_id={user_id}&user_proxy_config={encoded}',
+            api_key=self.api_key)
+        if start_resp.get('code') == 0:
+            return True, 'start_with_proxy'
+        self._log(f'Method 3 failed: {start_resp.get("msg", "")}')
+
+        self._log('Method 4: stop + start with launch args...')
+        proxy_host = proxy_config.get('proxy_host', '')
+        proxy_port = proxy_config.get('proxy_port', '')
+        proxy_user = proxy_config.get('proxy_user', '')
+        proxy_pass = proxy_config.get('proxy_password', '')
+
+        if proxy_user:
+            proxy_url = f'http://{proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}'
+        else:
+            proxy_url = f'http://{proxy_host}:{proxy_port}'
+
+        launch_args = json.dumps([f'--proxy-server={proxy_url}'])
+        encoded_args = urllib.parse.quote(launch_args)
+        start_resp2 = api_get(
+            f'/api/v1/browser/start?user_id={user_id}&launch_args={encoded_args}',
+            api_key=self.api_key)
+        if start_resp2.get('code') == 0:
+            return True, 'start_with_args'
+        self._log(f'Method 4 failed: {start_resp2.get("msg", "")}')
+
+        return False, None
+
     def _rotate_profile(self, user_id):
         if not self.proxies:
             self._log('No proxies loaded! Load proxies.txt first.')
             messagebox.showwarning('No Proxies', 'Load proxies.txt first.')
-            return
-
-        if not self.api_key:
-            self._log('No API key! Enter your AdsPower API key first.')
-            messagebox.showwarning('No API Key',
-                'Enter your AdsPower API Key first.\n\n'
-                'Find it in: AdsPower > Settings > Security > API Key')
             return
 
         widgets = self.profile_widgets.get(user_id)
@@ -439,37 +490,33 @@ class ProxyRotatorApp:
                 'proxy_password': proxy.get('password', '')
             }
 
-            resp = api_post('/api/v1/user/update', {
-                'user_id': user_id,
-                'user_proxy_config': proxy_config
-            }, api_key=self.api_key)
+            success, method = self._try_update_proxy(user_id, proxy_config)
 
-            if resp.get('code') != 0:
-                msg = resp.get('msg', 'unknown')
-                self._log(f'Update failed: {msg}')
-                if 'permission' in msg.lower():
-                    self._log('Check your API key in AdsPower > Settings > Security')
+            if not success:
+                self._log(f'All methods failed for {user_id}')
+                self._log('Try: AdsPower > API & MCP > Enable "API verification"')
                 self.root.after(0, lambda: self._update_profile_ui(user_id, 'FAILED', '#ff4444'))
                 return
 
-            self._log(f'Proxy updated for {user_id}. Restarting browser...')
+            self._log(f'Success via {method}!')
 
-            stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id},
-                                 api_key=self.api_key)
-            if stop_resp.get('code') != 0:
-                self._log(f'Stop warning: {stop_resp.get("msg", "")}')
-
-            time.sleep(1.5)
-
-            start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}',
-                                 api_key=self.api_key)
-            if start_resp.get('code') == 0:
-                self._log(f'Profile {user_id} restarted with {display}')
-                self.root.after(0, lambda: self._update_profile_ui(user_id, display, '#44dd44'))
+            if method.startswith('update'):
+                self._log(f'Proxy updated. Restarting browser...')
+                stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id},
+                                     api_key=self.api_key)
+                if stop_resp.get('code') != 0:
+                    self._log(f'Stop warning: {stop_resp.get("msg", "")}')
+                time.sleep(1.5)
+                start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}',
+                                     api_key=self.api_key)
+                if start_resp.get('code') == 0:
+                    self._log(f'Profile {user_id} restarted with {display}')
+                else:
+                    self._log(f'Browser restart failed - restart manually')
             else:
-                self._log(f'Start failed: {start_resp.get("msg", "")}')
-                self._log(f'Proxy was updated to {display} - restart manually in AdsPower')
-                self.root.after(0, lambda: self._update_profile_ui(user_id, f'{display} (restart)', '#FFD700'))
+                self._log(f'Profile {user_id} started with {display}')
+
+            self.root.after(0, lambda: self._update_profile_ui(user_id, display, '#44dd44'))
 
         threading.Thread(target=do_rotate, daemon=True).start()
 
