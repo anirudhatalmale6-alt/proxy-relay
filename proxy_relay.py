@@ -1,6 +1,7 @@
 """
-ProxyRotator v6.0 - Instant Proxy Rotation for AdsPower
-ADD = sets up relay + one restart. After that, ROTATE is instant (no restart).
+ProxyRotator v6.1 - Instant Proxy Rotation for AdsPower
+ADD = sets up relay + one restart (one time ever per profile).
+After that, ROTATE is always instant. Setup persists between sessions.
 Place proxies.txt next to this .exe (format: host:port:user:pass)
 """
 
@@ -23,7 +24,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "6.0"
+VERSION = "6.1"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 BASE_PORT = 10100
@@ -340,7 +341,7 @@ class ProxyRotatorApp:
         tf.pack(fill='x', padx=15, pady=(10, 5))
         tk.Label(tf, text='PROXY ROTATOR', font=('Segoe UI', 16, 'bold'),
                  fg='#e94560', bg='#1a1a2e').pack()
-        tk.Label(tf, text=f'v{VERSION} - ADD once (restarts), then ROTATE is instant',
+        tk.Label(tf, text=f'v{VERSION} - Set up once, rotate forever',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
 
         cf = tk.Frame(self.root, bg='#1a1a2e')
@@ -355,6 +356,10 @@ class ProxyRotatorApp:
         tk.Button(cf, text='Load proxies.txt', font=('Segoe UI', 8),
                   fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
                   cursor='hand2', command=self._browse_proxies).pack(side='right', padx=4)
+
+        tk.Button(cf, text='RESTORE ALL & EXIT', font=('Segoe UI', 8),
+                  fg='#fff', bg='#b71c1c', border=0, padx=8, pady=2,
+                  cursor='hand2', command=self._restore_all_and_exit).pack(side='right', padx=4)
 
         sf = tk.Frame(self.root, bg='#1a1a2e')
         sf.pack(fill='x', padx=15, pady=(5, 2))
@@ -375,7 +380,7 @@ class ProxyRotatorApp:
                   cursor='hand2', command=self._add_profile)
         self.search_btn.pack(side='left', padx=4)
 
-        tk.Label(sf, text='(restarts once to set up relay)',
+        tk.Label(sf, text='(one-time restart per profile, then instant forever)',
                  font=('Segoe UI', 8), fg='#666', bg='#1a1a2e').pack(side='left', padx=4)
 
         info = tk.Label(self.root,
@@ -535,8 +540,8 @@ class ProxyRotatorApp:
         if not self.dashboard:
             tk.Label(self.profiles_frame,
                 text='No profiles yet.\n\nType a serial number and click ADD.\n'
-                     'Browser restarts ONCE to set up relay.\n'
-                     'After that, ROTATE is instant - no restart!',
+                     'Browser restarts ONCE (first time ever).\n'
+                     'After that, ROTATE is always instant - even after restarting this app!',
                 font=('Segoe UI', 10), fg='#888', bg='#16213e', pady=30).pack()
             return
 
@@ -716,21 +721,43 @@ class ProxyRotatorApp:
 
         threading.Thread(target=do_remove, daemon=True).start()
 
-    def _on_close(self):
-        for uid, info in list(self.dashboard.items()):
-            orig_cfg = info.get('original_config')
-            if orig_cfg:
-                try:
+    def _restore_all_and_exit(self):
+        if not self.dashboard:
+            self.root.destroy()
+            return
+
+        if not messagebox.askyesno('Restore All',
+                'This will restore ALL profiles to their original proxies\n'
+                'and remove them from the dashboard.\n\nContinue?'):
+            return
+
+        self._log('Restoring all profiles to original proxies...')
+
+        def do_restore_all():
+            for uid, info in list(self.dashboard.items()):
+                serial = info.get('serial', '?')
+                orig_cfg = info.get('original_config')
+                if orig_cfg:
                     api_post('/api/v1/user/update', {
                         'user_id': uid,
                         'user_proxy_config': orig_cfg
                     })
-                except Exception:
-                    pass
+                    self.root.after(0, lambda s=serial: self._log(f'{s}: restored'))
 
+                relay = self.relays.pop(uid, None)
+                if relay:
+                    relay.stop()
+
+            self.dashboard.clear()
+            self._save_dashboard()
+            self.root.after(0, lambda: self._log('All profiles restored. Closing...'))
+            self.root.after(500, self.root.destroy)
+
+        threading.Thread(target=do_restore_all, daemon=True).start()
+
+    def _on_close(self):
         for relay in self.relays.values():
             relay.stop()
-
         self.root.destroy()
 
     def run(self):
