@@ -1,6 +1,6 @@
 """
-ProxyRotator v2.3 - Per-Profile Proxy Rotation for AdsPower
-Only shows profiles with running browsers.
+ProxyRotator v2.4 - Per-Profile Proxy Rotation for AdsPower
+Search by serial number to find your profiles.
 Each profile gets its own ROTATE button.
 
 Place proxies.txt next to this .exe (format: host:port:user:pass)
@@ -15,7 +15,6 @@ import os
 import sys
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import urllib.request
@@ -24,7 +23,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.3"
+VERSION = "2.4"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 
@@ -120,11 +119,6 @@ def api_post(path, data=None, api_key=''):
         return {'code': -1, 'msg': str(e)}
 
 
-def check_browser_active(user_id, api_key=''):
-    resp = api_get(f'/api/v1/browser/active?user_id={user_id}', api_key=api_key)
-    return resp.get('code') == 0
-
-
 class ProxyRotatorApp:
     def __init__(self):
         self.root = tk.Tk()
@@ -134,10 +128,11 @@ class ProxyRotatorApp:
         self.root.configure(bg='#1a1a2e')
 
         self.proxies = []
+        self.all_profiles = []
         self.profiles = []
-        self.profile_proxies = {}
         self.profile_widgets = {}
         self.api_key = ''
+        self.search_after_id = None
 
         self._load_config()
         self._load_proxies()
@@ -233,10 +228,31 @@ class ProxyRotatorApp:
                   cursor='hand2', command=self._refresh_profiles)
         self.refresh_btn.pack(side='right', padx=4)
 
+        # Search row
+        sf = tk.Frame(self.root, bg='#1a1a2e')
+        sf.pack(fill='x', padx=15, pady=(5, 2))
+
+        tk.Label(sf, text='Search:', font=('Segoe UI', 9, 'bold'),
+                 fg='#ddd', bg='#1a1a2e').pack(side='left')
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add('write', self._on_search)
+        search_entry = tk.Entry(sf, textvariable=self.search_var, font=('Consolas', 10),
+                                bg='#0a0a1a', fg='#FFD700', insertbackground='#FFD700',
+                                border=1, relief='solid', width=20)
+        search_entry.pack(side='left', padx=(6, 4))
+
+        tk.Label(sf, text='type serial number (e.g. 27764)',
+                 font=('Segoe UI', 8), fg='#666', bg='#1a1a2e').pack(side='left', padx=4)
+
+        self.match_label = tk.Label(sf, text='', font=('Segoe UI', 8, 'bold'),
+                                     fg='#8888aa', bg='#1a1a2e')
+        self.match_label.pack(side='right')
+
         # Profiles list header
         hf = tk.Frame(self.root, bg='#0f3460')
         hf.pack(fill='x', padx=15, pady=(8, 0))
-        self.header_label = tk.Label(hf, text='Running Profiles', font=('Segoe UI', 9, 'bold'),
+        self.header_label = tk.Label(hf, text='Profile', font=('Segoe UI', 9, 'bold'),
                  fg='#fff', bg='#0f3460', width=20, anchor='w')
         self.header_label.pack(side='left', padx=(8, 0))
         tk.Label(hf, text='Current Proxy', font=('Segoe UI', 9, 'bold'), fg='#fff',
@@ -263,7 +279,7 @@ class ProxyRotatorApp:
 
         # No profiles message
         self.no_profiles_label = tk.Label(self.profiles_frame,
-            text='No running profiles found.\nOpen some profiles in AdsPower first.',
+            text='Loading profiles...',
             font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
 
         # Log area
@@ -287,6 +303,25 @@ class ProxyRotatorApp:
             self._log('No API key set - enter your AdsPower API key above')
             self._log('Find it in: AdsPower > Settings > Security > API Key')
 
+    def _on_search(self, *args):
+        if self.search_after_id:
+            self.root.after_cancel(self.search_after_id)
+        self.search_after_id = self.root.after(200, self._apply_filter)
+
+    def _apply_filter(self):
+        query = self.search_var.get().strip().lower()
+        if not query:
+            self.profiles = list(self.all_profiles)
+        else:
+            self.profiles = [p for p in self.all_profiles
+                             if query in str(p.get('serial', '')).lower()
+                             or query in p.get('name', '').lower()
+                             or query in p.get('user_id', '').lower()]
+
+        self.match_label.configure(
+            text=f'{len(self.profiles)} matches' if query else f'{len(self.all_profiles)} total')
+        self._render_profiles()
+
     def _browse_proxies(self):
         filepath = filedialog.askopenfilename(
             title='Select Proxy List',
@@ -300,13 +335,13 @@ class ProxyRotatorApp:
             self._log(f'Loaded {len(self.proxies)} proxies from {os.path.basename(filepath)}')
 
     def _refresh_profiles(self):
-        self.refresh_btn.configure(state='disabled', text='Scanning...')
+        self.refresh_btn.configure(state='disabled', text='Loading...')
 
         def do_refresh():
             self._log('Fetching profiles from AdsPower...')
 
-            all_profiles = []
-            for page in range(1, 100):
+            fetched = []
+            for page in range(1, 200):
                 resp = api_get(f'/api/v1/user/list?page={page}&page_size=100',
                                api_key=self.api_key)
                 if resp.get('code') != 0:
@@ -320,38 +355,17 @@ class ProxyRotatorApp:
                 page_list = data.get('list', [])
                 if not page_list:
                     break
-                all_profiles.extend(page_list)
+                fetched.extend(page_list)
+                if page % 5 == 0:
+                    self._log(f'Loading... {len(fetched)} profiles so far')
 
-            if not all_profiles:
+            if not fetched:
                 self._log('No profiles found in AdsPower')
                 self.root.after(0, self._refresh_done_empty)
                 return
 
-            self._log(f'Found {len(all_profiles)} total profiles. Checking which are running...')
-
-            running_profiles = []
-            checked = 0
-
-            def check_one(profile_data):
-                uid = profile_data.get('user_id', '')
-                is_active = check_browser_active(uid, api_key=self.api_key)
-                return profile_data, is_active
-
-            with ThreadPoolExecutor(max_workers=20) as pool:
-                futures = {pool.submit(check_one, p): p for p in all_profiles}
-                for future in as_completed(futures):
-                    checked += 1
-                    if checked % 50 == 0:
-                        self._log(f'Checked {checked}/{len(all_profiles)} profiles...')
-                    try:
-                        profile_data, is_active = future.result()
-                        if is_active:
-                            running_profiles.append(profile_data)
-                    except Exception:
-                        pass
-
-            self.profiles = []
-            for p in running_profiles:
+            self.all_profiles = []
+            for p in fetched:
                 user_id = p.get('user_id', '')
                 serial = p.get('serial_number', '')
                 name = p.get('name', '') or p.get('remark', '') or serial or user_id
@@ -364,28 +378,33 @@ class ProxyRotatorApp:
                 else:
                     current_proxy = 'no proxy'
 
-                self.profiles.append({
+                self.all_profiles.append({
                     'user_id': user_id,
                     'serial': serial,
                     'name': name,
                     'current_proxy': current_proxy
                 })
 
-            self.profiles.sort(key=lambda p: p.get('serial', ''))
+            self.all_profiles.sort(key=lambda p: str(p.get('serial', '')))
 
-            self._log(f'{len(self.profiles)} running profiles found')
-            self.root.after(0, self._render_profiles)
-            self.root.after(0, lambda: self.refresh_btn.configure(
-                state='normal', text='Refresh Profiles'))
+            self._log(f'Loaded {len(self.all_profiles)} profiles. Type a serial number to search.')
+            self.root.after(0, self._refresh_done)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
     def _refresh_done_empty(self):
         self.refresh_btn.configure(state='normal', text='Refresh Profiles')
+        for w in self.profiles_frame.winfo_children():
+            w.destroy()
         self.no_profiles_label = tk.Label(self.profiles_frame,
-            text='No running profiles found.\nOpen some profiles in AdsPower first.',
+            text='No profiles found.\nMake sure AdsPower is running.',
             font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
         self.no_profiles_label.pack(pady=20)
+
+    def _refresh_done(self):
+        self.refresh_btn.configure(state='normal', text='Refresh Profiles')
+        self.match_label.configure(text=f'{len(self.all_profiles)} total')
+        self._apply_filter()
 
     def _render_profiles(self):
         for w in self.profiles_frame.winfo_children():
@@ -393,15 +412,16 @@ class ProxyRotatorApp:
         self.profile_widgets = {}
 
         if not self.profiles:
-            self.no_profiles_label = tk.Label(self.profiles_frame,
-                text='No running profiles found.\nOpen some profiles in AdsPower first.',
+            msg = 'No matching profiles.\nTry a different search.' if self.search_var.get().strip() \
+                else 'No profiles found.\nMake sure AdsPower is running.'
+            lbl = tk.Label(self.profiles_frame, text=msg,
                 font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
-            self.no_profiles_label.pack()
+            lbl.pack()
             return
 
-        self.header_label.configure(text=f'Running ({len(self.profiles)})')
+        display_list = self.profiles[:50]
 
-        for i, profile in enumerate(self.profiles):
+        for i, profile in enumerate(display_list):
             bg = '#1a2744' if i % 2 == 0 else '#16213e'
             row = tk.Frame(self.profiles_frame, bg=bg)
             row.pack(fill='x', padx=2, pady=1)
@@ -433,6 +453,11 @@ class ProxyRotatorApp:
                 'rotate_btn': rotate_btn,
                 'row': row
             }
+
+        if len(self.profiles) > 50:
+            tk.Label(self.profiles_frame,
+                     text=f'... and {len(self.profiles) - 50} more. Narrow your search.',
+                     font=('Segoe UI', 8), fg='#666', bg='#16213e', pady=5).pack()
 
         self.canvas.configure(scrollregion=self.canvas.bbox('all'))
 
