@@ -1,7 +1,7 @@
 """
-ProxyRotator v2.2 - Per-Profile Proxy Rotation for AdsPower
+ProxyRotator v2.3 - Per-Profile Proxy Rotation for AdsPower
+Only shows profiles with running browsers.
 Each profile gets its own ROTATE button.
-Uses AdsPower API to update proxy + restart browser.
 
 Place proxies.txt next to this .exe (format: host:port:user:pass)
 Requires AdsPower API Key (Settings > Security > API Key)
@@ -15,6 +15,7 @@ import os
 import sys
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import urllib.request
@@ -23,7 +24,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.2"
+VERSION = "2.3"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 
@@ -117,6 +118,11 @@ def api_post(path, data=None, api_key=''):
             return json.loads(resp.read().decode())
     except Exception as e:
         return {'code': -1, 'msg': str(e)}
+
+
+def check_browser_active(user_id, api_key=''):
+    resp = api_get(f'/api/v1/browser/active?user_id={user_id}', api_key=api_key)
+    return resp.get('code') == 0
 
 
 class ProxyRotatorApp:
@@ -222,15 +228,17 @@ class ProxyRotatorApp:
                   fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
                   cursor='hand2', command=self._browse_proxies).pack(side='right', padx=4)
 
-        tk.Button(cf, text='Refresh Profiles', font=('Segoe UI', 8),
+        self.refresh_btn = tk.Button(cf, text='Refresh Profiles', font=('Segoe UI', 8),
                   fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
-                  cursor='hand2', command=self._refresh_profiles).pack(side='right', padx=4)
+                  cursor='hand2', command=self._refresh_profiles)
+        self.refresh_btn.pack(side='right', padx=4)
 
         # Profiles list header
         hf = tk.Frame(self.root, bg='#0f3460')
         hf.pack(fill='x', padx=15, pady=(8, 0))
-        tk.Label(hf, text='Profile', font=('Segoe UI', 9, 'bold'), fg='#fff',
-                 bg='#0f3460', width=20, anchor='w').pack(side='left', padx=(8, 0))
+        self.header_label = tk.Label(hf, text='Running Profiles', font=('Segoe UI', 9, 'bold'),
+                 fg='#fff', bg='#0f3460', width=20, anchor='w')
+        self.header_label.pack(side='left', padx=(8, 0))
         tk.Label(hf, text='Current Proxy', font=('Segoe UI', 9, 'bold'), fg='#fff',
                  bg='#0f3460', width=25, anchor='w').pack(side='left')
         tk.Label(hf, text='', font=('Segoe UI', 9), bg='#0f3460',
@@ -255,7 +263,7 @@ class ProxyRotatorApp:
 
         # No profiles message
         self.no_profiles_label = tk.Label(self.profiles_frame,
-            text='No profiles found.\nMake sure AdsPower is running.',
+            text='No running profiles found.\nOpen some profiles in AdsPower first.',
             font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
 
         # Log area
@@ -292,17 +300,19 @@ class ProxyRotatorApp:
             self._log(f'Loaded {len(self.proxies)} proxies from {os.path.basename(filepath)}')
 
     def _refresh_profiles(self):
+        self.refresh_btn.configure(state='disabled', text='Scanning...')
+
         def do_refresh():
             self._log('Fetching profiles from AdsPower...')
 
             all_profiles = []
-            for page in range(1, 50):
+            for page in range(1, 100):
                 resp = api_get(f'/api/v1/user/list?page={page}&page_size=100',
                                api_key=self.api_key)
                 if resp.get('code') != 0:
                     if page == 1:
                         self._log(f'AdsPower API error: {resp.get("msg", "unknown")}')
-                        self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
+                        self.root.after(0, self._refresh_done_empty)
                         return
                     break
 
@@ -314,11 +324,34 @@ class ProxyRotatorApp:
 
             if not all_profiles:
                 self._log('No profiles found in AdsPower')
-                self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
+                self.root.after(0, self._refresh_done_empty)
                 return
 
+            self._log(f'Found {len(all_profiles)} total profiles. Checking which are running...')
+
+            running_profiles = []
+            checked = 0
+
+            def check_one(profile_data):
+                uid = profile_data.get('user_id', '')
+                is_active = check_browser_active(uid, api_key=self.api_key)
+                return profile_data, is_active
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                futures = {pool.submit(check_one, p): p for p in all_profiles}
+                for future in as_completed(futures):
+                    checked += 1
+                    if checked % 50 == 0:
+                        self._log(f'Checked {checked}/{len(all_profiles)} profiles...')
+                    try:
+                        profile_data, is_active = future.result()
+                        if is_active:
+                            running_profiles.append(profile_data)
+                    except Exception:
+                        pass
+
             self.profiles = []
-            for p in all_profiles:
+            for p in running_profiles:
                 user_id = p.get('user_id', '')
                 serial = p.get('serial_number', '')
                 name = p.get('name', '') or p.get('remark', '') or serial or user_id
@@ -338,10 +371,21 @@ class ProxyRotatorApp:
                     'current_proxy': current_proxy
                 })
 
-            self._log(f'Found {len(self.profiles)} profiles')
+            self.profiles.sort(key=lambda p: p.get('serial', ''))
+
+            self._log(f'{len(self.profiles)} running profiles found')
             self.root.after(0, self._render_profiles)
+            self.root.after(0, lambda: self.refresh_btn.configure(
+                state='normal', text='Refresh Profiles'))
 
         threading.Thread(target=do_refresh, daemon=True).start()
+
+    def _refresh_done_empty(self):
+        self.refresh_btn.configure(state='normal', text='Refresh Profiles')
+        self.no_profiles_label = tk.Label(self.profiles_frame,
+            text='No running profiles found.\nOpen some profiles in AdsPower first.',
+            font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
+        self.no_profiles_label.pack(pady=20)
 
     def _render_profiles(self):
         for w in self.profiles_frame.winfo_children():
@@ -350,10 +394,12 @@ class ProxyRotatorApp:
 
         if not self.profiles:
             self.no_profiles_label = tk.Label(self.profiles_frame,
-                text='No profiles found.\nMake sure AdsPower is running.',
+                text='No running profiles found.\nOpen some profiles in AdsPower first.',
                 font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
             self.no_profiles_label.pack()
             return
+
+        self.header_label.configure(text=f'Running ({len(self.profiles)})')
 
         for i, profile in enumerate(self.profiles):
             bg = '#1a2744' if i % 2 == 0 else '#16213e'
