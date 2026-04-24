@@ -1,6 +1,6 @@
 """
 Bulk Kernel Changer for AdsPower
-Changes browser kernel version for all profiles at once.
+Pick a folder/group, pick kernel version, change all at once.
 """
 
 import tkinter as tk
@@ -45,12 +45,14 @@ class KernelChangerApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title('AdsPower Bulk Kernel Changer')
-        self.root.geometry('500x450')
+        self.root.geometry('550x520')
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
         self.running = False
+        self.groups = {}
 
         self._build_ui()
+        self.root.after(500, self._load_groups)
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
@@ -64,45 +66,56 @@ class KernelChangerApp:
     def _build_ui(self):
         tk.Label(self.root, text='BULK KERNEL CHANGER',
                  font=('Segoe UI', 16, 'bold'),
-                 fg='#e94560', bg='#1a1a2e').pack(pady=(15, 5))
+                 fg='#e94560', bg='#1a1a2e').pack(pady=(15, 3))
 
-        tk.Label(self.root, text='Change browser kernel for ALL profiles at once',
-                 font=('Segoe UI', 9), fg='#8888aa', bg='#1a1a2e').pack()
+        tk.Label(self.root, text='Pick a folder, pick a kernel, change all at once',
+                 font=('Segoe UI', 9), fg='#8888aa', bg='#1a1a2e').pack(pady=(0, 10))
 
-        sf = tk.Frame(self.root, bg='#1a1a2e')
-        sf.pack(pady=15)
+        gf = tk.Frame(self.root, bg='#1a1a2e')
+        gf.pack(fill='x', padx=20, pady=5)
 
-        tk.Label(sf, text='Target Kernel:', font=('Segoe UI', 12, 'bold'),
-                 fg='#FFD700', bg='#1a1a2e').pack(side='left', padx=(0, 10))
+        tk.Label(gf, text='Folder:', font=('Segoe UI', 11, 'bold'),
+                 fg='#FFD700', bg='#1a1a2e').pack(side='left')
+
+        self.group_var = tk.StringVar(value='-- Loading groups --')
+        self.group_menu = tk.OptionMenu(gf, self.group_var, '-- Loading --')
+        self.group_menu.configure(font=('Segoe UI', 10), fg='#fff',
+                                   bg='#0f3460', activebackground='#16213e',
+                                   highlightthickness=0, width=35, anchor='w')
+        self.group_menu.pack(side='left', padx=(8, 0), fill='x', expand=True)
+
+        tk.Button(gf, text='Reload', font=('Segoe UI', 8),
+                  fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
+                  cursor='hand2', command=self._load_groups).pack(side='right', padx=(8, 0))
+
+        kf = tk.Frame(self.root, bg='#1a1a2e')
+        kf.pack(fill='x', padx=20, pady=5)
+
+        tk.Label(kf, text='Kernel:', font=('Segoe UI', 11, 'bold'),
+                 fg='#FFD700', bg='#1a1a2e').pack(side='left')
 
         self.kernel_var = tk.StringVar(value='141')
         versions = ['146', '145', '144', '143', '142', '141', '140', '139']
-        kernel_menu = tk.OptionMenu(sf, self.kernel_var, *versions)
-        kernel_menu.configure(font=('Consolas', 14, 'bold'), fg='#FFD700',
+        kernel_menu = tk.OptionMenu(kf, self.kernel_var, *versions)
+        kernel_menu.configure(font=('Consolas', 13, 'bold'), fg='#FFD700',
                                bg='#0f3460', activebackground='#16213e',
                                highlightthickness=0, width=6)
-        kernel_menu.pack(side='left')
+        kernel_menu.pack(side='left', padx=(8, 0))
 
         bf = tk.Frame(self.root, bg='#1a1a2e')
-        bf.pack(pady=10)
+        bf.pack(pady=12)
 
-        self.start_btn = tk.Button(bf, text='CHANGE ALL PROFILES',
+        self.start_btn = tk.Button(bf, text='CHANGE KERNEL FOR FOLDER',
                   font=('Segoe UI', 12, 'bold'),
                   fg='#fff', bg='#e94560', activebackground='#ff6b8a',
                   border=0, padx=20, pady=8,
                   cursor='hand2', command=self._start_change)
-        self.start_btn.pack(side='left', padx=5)
-
-        self.count_btn = tk.Button(bf, text='COUNT PROFILES',
-                  font=('Segoe UI', 10),
-                  fg='#fff', bg='#0f3460', border=0, padx=12, pady=6,
-                  cursor='hand2', command=self._count_profiles)
-        self.count_btn.pack(side='left', padx=5)
+        self.start_btn.pack()
 
         self.progress_label = tk.Label(self.root, text='',
                  font=('Segoe UI', 11, 'bold'),
                  fg='#44dd44', bg='#1a1a2e')
-        self.progress_label.pack(pady=5)
+        self.progress_label.pack(pady=3)
 
         lf = tk.Frame(self.root, bg='#1a1a2e')
         lf.pack(fill='both', expand=True, padx=15, pady=(5, 15))
@@ -111,41 +124,78 @@ class KernelChangerApp:
                                 insertbackground='#44dd44', border=0, wrap='word', state='disabled')
         self.log_text.pack(fill='both', expand=True, pady=2)
 
-        self._log('Ready. Select target kernel version and click CHANGE ALL PROFILES.')
-        self._log('Make sure AdsPower is running with Local API enabled.')
+        self._log('Loading groups from AdsPower...')
 
-    def _count_profiles(self):
-        def do_count():
-            self._log('Counting profiles...')
-            total = 0
-            page = 1
-            while True:
-                resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
-                if resp.get('code') != 0:
-                    self._log(f'API error: {resp.get("msg", "")}')
-                    break
-                lst = resp.get('data', {}).get('list', [])
-                if not lst:
-                    break
-                total += len(lst)
-                page += 1
+    def _load_groups(self):
+        def do_load():
+            self.groups = {}
 
-            self.root.after(0, lambda: self.progress_label.configure(
-                text=f'Total profiles: {total}'))
-            self._log(f'Found {total} profiles')
+            resp = api_get('/api/v1/group/list')
+            if resp.get('code') == 0:
+                grp_list = resp.get('data', {}).get('list', [])
+                if isinstance(resp.get('data'), list):
+                    grp_list = resp['data']
+                for g in grp_list:
+                    gid = str(g.get('group_id', ''))
+                    gname = g.get('group_name', f'Group {gid}')
+                    if gid:
+                        self.groups[gname] = gid
+                self.root.after(0, lambda: self._log(
+                    f'Loaded {len(self.groups)} group(s) from API'))
+            else:
+                self.root.after(0, lambda: self._log(
+                    f'Group API: {resp.get("msg", "error")}. Scanning profiles for groups...'))
+                page = 1
+                while True:
+                    r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                    if r.get('code') != 0:
+                        break
+                    lst = r.get('data', {}).get('list', [])
+                    if not lst:
+                        break
+                    for p in lst:
+                        gid = str(p.get('group_id', '0'))
+                        gname = p.get('group_name', f'Group {gid}')
+                        if gname and gid and gname not in self.groups:
+                            self.groups[gname] = gid
+                    page += 1
+                self.root.after(0, lambda: self._log(
+                    f'Found {len(self.groups)} group(s) from profiles'))
 
-        threading.Thread(target=do_count, daemon=True).start()
+            self.root.after(0, self._update_group_menu)
+
+        threading.Thread(target=do_load, daemon=True).start()
+
+    def _update_group_menu(self):
+        menu = self.group_menu['menu']
+        menu.delete(0, 'end')
+
+        menu.add_command(label='--- ALL PROFILES ---',
+                         command=lambda: self.group_var.set('--- ALL PROFILES ---'))
+
+        for name in sorted(self.groups.keys()):
+            menu.add_command(label=name,
+                             command=lambda n=name: self.group_var.set(n))
+
+        if self.groups:
+            self.group_var.set(sorted(self.groups.keys())[0])
+        else:
+            self.group_var.set('--- ALL PROFILES ---')
 
     def _start_change(self):
         if self.running:
             return
 
         target = self.kernel_var.get()
+        selected = self.group_var.get()
+        group_id = self.groups.get(selected)
+        scope = selected if group_id else 'ALL PROFILES'
+
         if not messagebox.askyesno('Confirm',
-                f'Change ALL profiles to Chrome kernel {target}?\n\n'
-                f'This will update every profile in AdsPower.\n'
-                f'Profiles that are currently open will need to be\n'
-                f'closed and reopened to use the new kernel.'):
+                f'Change kernel to Chrome {target}\n'
+                f'for: {scope}?\n\n'
+                f'Open profiles need to be closed & reopened\n'
+                f'to use the new kernel.'):
             return
 
         self.running = True
@@ -156,11 +206,17 @@ class KernelChangerApp:
             success = 0
             failed = 0
             total = 0
+            skipped = 0
 
             while True:
-                resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                url = f'/api/v1/user/list?page={page}&page_size=100'
+                if group_id:
+                    url += f'&group_id={group_id}'
+
+                resp = api_get(url)
                 if resp.get('code') != 0:
-                    self.root.after(0, lambda: self._log(f'API error on page {page}: {resp.get("msg", "")}'))
+                    self.root.after(0, lambda: self._log(
+                        f'API error on page {page}: {resp.get("msg", "")}'))
                     break
 
                 profiles = resp.get('data', {}).get('list', [])
@@ -186,22 +242,24 @@ class KernelChangerApp:
                         success += 1
                     else:
                         failed += 1
-                        self.root.after(0, lambda s=sn, m=update_resp.get('msg', ''):
+                        msg = update_resp.get('msg', '')
+                        self.root.after(0, lambda s=sn, m=msg:
                             self._log(f'#{s}: FAILED - {m}'))
 
                     if total % 10 == 0:
                         self.root.after(0, lambda t=total, s=success, f=failed:
                             self.progress_label.configure(
-                                text=f'Progress: {t} checked, {s} ok, {f} failed'))
+                                text=f'Progress: {t} done, {s} ok, {f} failed'))
 
                 page += 1
 
             self.root.after(0, lambda: self._log(
-                f'DONE! Changed {success} profiles to Chrome {target}. Failed: {failed}. Total: {total}.'))
+                f'DONE! {scope}: {success} changed to Chrome {target}. '
+                f'Failed: {failed}. Total: {total}.'))
             self.root.after(0, lambda: self.progress_label.configure(
                 text=f'DONE: {success}/{total} changed to Chrome {target}'))
             self.root.after(0, lambda: self.start_btn.configure(
-                state='normal', text='CHANGE ALL PROFILES'))
+                state='normal', text='CHANGE KERNEL FOR FOLDER'))
             self.running = False
 
         threading.Thread(target=do_change, daemon=True).start()
