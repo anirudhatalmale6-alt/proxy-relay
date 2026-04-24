@@ -22,7 +22,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.0"
+VERSION = "2.1"
 API_BASE = "http://127.0.0.1:50325"
 
 
@@ -180,7 +180,7 @@ class ProxyRotatorApp:
 
         # No profiles message
         self.no_profiles_label = tk.Label(self.profiles_frame,
-            text='No active profiles found.\nStart some profiles in AdsPower first.',
+            text='No profiles found.\nMake sure AdsPower is running.',
             font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
 
         # Log area
@@ -212,39 +212,43 @@ class ProxyRotatorApp:
 
     def _refresh_profiles(self):
         def do_refresh():
-            self._log('Fetching active profiles from AdsPower...')
+            self._log('Fetching profiles from AdsPower...')
 
-            resp = api_get('/api/v1/browser/active?page=1&page_size=100')
-            if resp.get('code') != 0:
-                self._log(f'AdsPower API error: {resp.get("msg", "unknown")}')
-                self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
-                return
+            # Get all profiles via user/list (paginated)
+            all_profiles = []
+            for page in range(1, 50):
+                resp = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+                if resp.get('code') != 0:
+                    if page == 1:
+                        self._log(f'AdsPower API error: {resp.get("msg", "unknown")}')
+                        self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
+                        return
+                    break
 
-            data = resp.get('data', {})
-            profile_list = data.get('list', [])
-            if not profile_list:
-                self._log('No active profiles found')
+                data = resp.get('data', {})
+                page_list = data.get('list', [])
+                if not page_list:
+                    break
+                all_profiles.extend(page_list)
+
+            if not all_profiles:
+                self._log('No profiles found in AdsPower')
                 self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
                 return
 
             self.profiles = []
-            for p in profile_list:
+            for p in all_profiles:
                 user_id = p.get('user_id', '')
                 serial = p.get('serial_number', '')
                 name = p.get('name', '') or p.get('remark', '') or serial or user_id
 
-                profile_resp = api_get(f'/api/v1/user/list?user_id={user_id}')
-                current_proxy = 'unknown'
-                if profile_resp.get('code') == 0:
-                    plist = profile_resp.get('data', {}).get('list', [])
-                    if plist:
-                        proxy_cfg = plist[0].get('user_proxy_config', {})
-                        ph = proxy_cfg.get('proxy_host', '')
-                        pp = proxy_cfg.get('proxy_port', '')
-                        if ph:
-                            current_proxy = f'{ph}:{pp}'
-                        else:
-                            current_proxy = 'no proxy'
+                proxy_cfg = p.get('user_proxy_config', {})
+                ph = proxy_cfg.get('proxy_host', '')
+                pp = proxy_cfg.get('proxy_port', '')
+                if ph:
+                    current_proxy = f'{ph}:{pp}'
+                else:
+                    current_proxy = 'no proxy'
 
                 self.profiles.append({
                     'user_id': user_id,
@@ -253,7 +257,7 @@ class ProxyRotatorApp:
                     'current_proxy': current_proxy
                 })
 
-            self._log(f'Found {len(self.profiles)} active profiles')
+            self._log(f'Found {len(self.profiles)} profiles')
             self.root.after(0, self._render_profiles)
 
         threading.Thread(target=do_refresh, daemon=True).start()
@@ -265,7 +269,7 @@ class ProxyRotatorApp:
 
         if not self.profiles:
             self.no_profiles_label = tk.Label(self.profiles_frame,
-                text='No active profiles found.\nStart some profiles in AdsPower first.',
+                text='No profiles found.\nMake sure AdsPower is running.',
                 font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
             self.no_profiles_label.pack()
             return
