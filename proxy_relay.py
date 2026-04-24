@@ -1,26 +1,29 @@
 """
-ProxyRelay v1.0 - Local proxy relay with HTTP control API
-Runs a local HTTP proxy that forwards to authenticated upstream proxies.
-Chrome extension controls which upstream proxy to use via REST API.
+ProxyRotator v2.0 - Per-Profile Proxy Rotation for AdsPower
+Each profile gets its own ROTATE button.
+Uses AdsPower API to update proxy + restart browser.
 
-Setup: Set AdsPower profile proxy to 127.0.0.1:8899 (HTTP)
-       Extension talks to control API on 127.0.0.1:8900
+Place proxies.txt next to this .exe (format: host:port:user:pass)
 """
 
 import tkinter as tk
-import socket
-import select
-import base64
+from tkinter import filedialog, messagebox
 import threading
 import json
 import os
 import sys
 import random
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
+try:
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+except ImportError:
+    pass
 
-VERSION = "1.0"
+VERSION = "2.0"
+API_BASE = "http://127.0.0.1:50325"
 
 
 def get_app_dir():
@@ -31,29 +34,6 @@ def get_app_dir():
 
 def get_proxies_path():
     return os.path.join(get_app_dir(), 'proxies.txt')
-
-
-def get_config_path():
-    return os.path.join(get_app_dir(), 'relay_config.json')
-
-
-def load_config():
-    path = get_config_path()
-    if os.path.exists(path):
-        try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {'proxy_port': 8899, 'api_port': 8900}
-
-
-def save_config(cfg):
-    try:
-        with open(get_config_path(), 'w') as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
 
 
 def load_proxies_from_file(filepath):
@@ -68,219 +48,67 @@ def load_proxies_from_file(filepath):
                 if len(parts) >= 4:
                     proxies.append({
                         'host': parts[0],
-                        'port': int(parts[1]),
+                        'port': parts[1],
                         'username': parts[2],
                         'password': parts[3]
                     })
                 elif len(parts) == 2:
                     proxies.append({
                         'host': parts[0],
-                        'port': int(parts[1]),
-                        'username': None,
-                        'password': None
+                        'port': parts[1],
+                        'username': '',
+                        'password': ''
                     })
     except Exception as e:
-        print(f'[Relay] Error loading proxies: {e}')
+        print(f'Error loading proxies: {e}')
     return proxies
 
 
-class ProxyForwarder:
-    def __init__(self, local_port=8899):
-        self.local_port = local_port
-        self.upstream_host = None
-        self.upstream_port = None
-        self.upstream_user = None
-        self.upstream_pass = None
-        self.server_socket = None
-        self.running = False
-        self.thread = None
-        self.connections = 0
-
-    def set_upstream(self, host, port, username=None, password=None):
-        self.upstream_host = host
-        self.upstream_port = int(port)
-        self.upstream_user = username
-        self.upstream_pass = password
-
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self._run_server, daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.running = False
-        if self.server_socket:
-            try:
-                self.server_socket.close()
-            except Exception:
-                pass
-        self.server_socket = None
-
-    def restart(self):
-        self.stop()
-        time.sleep(0.2)
-        self.running = True
-        self.thread = threading.Thread(target=self._run_server, daemon=True)
-        self.thread.start()
-
-    def _run_server(self):
-        try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.settimeout(1.0)
-            self.server_socket.bind(('127.0.0.1', self.local_port))
-            self.server_socket.listen(50)
-            print(f'[Relay] Proxy listening on 127.0.0.1:{self.local_port}')
-
-            while self.running:
-                try:
-                    client_sock, addr = self.server_socket.accept()
-                    client_sock.settimeout(30)
-                    t = threading.Thread(target=self._handle_client, args=(client_sock,), daemon=True)
-                    t.start()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-        except Exception as e:
-            print(f'[Relay] Server error: {e}')
-        finally:
-            self.running = False
-
-    def _handle_client(self, client_sock):
-        upstream_sock = None
-        try:
-            if not self.upstream_host:
-                client_sock.sendall(b'HTTP/1.1 502 No upstream proxy configured\r\n\r\n')
-                client_sock.close()
-                return
-
-            self.connections += 1
-            request_data = b''
-            while b'\r\n\r\n' not in request_data:
-                chunk = client_sock.recv(4096)
-                if not chunk:
-                    client_sock.close()
-                    return
-                request_data += chunk
-
-            first_line = request_data.split(b'\r\n')[0].decode('utf-8', errors='replace')
-            method = first_line.split(' ')[0]
-
-            auth_header = ''
-            if self.upstream_user and self.upstream_pass:
-                auth_str = f'{self.upstream_user}:{self.upstream_pass}'
-                auth_b64 = base64.b64encode(auth_str.encode()).decode()
-                auth_header = f'Proxy-Authorization: Basic {auth_b64}\r\n'
-
-            upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            upstream_sock.settimeout(30)
-            upstream_sock.connect((self.upstream_host, self.upstream_port))
-
-            if method == 'CONNECT':
-                header_end = request_data.index(b'\r\n\r\n')
-                headers = request_data[:header_end].decode('utf-8', errors='replace')
-                lines = headers.split('\r\n')
-                new_request = lines[0] + '\r\n'
-                if auth_header:
-                    new_request += auth_header
-                for line in lines[1:]:
-                    if line.lower().startswith('proxy-authorization'):
-                        continue
-                    new_request += line + '\r\n'
-                new_request += '\r\n'
-
-                upstream_sock.sendall(new_request.encode())
-
-                response = b''
-                while b'\r\n\r\n' not in response:
-                    chunk = upstream_sock.recv(4096)
-                    if not chunk:
-                        break
-                    response += chunk
-
-                status_line = response.split(b'\r\n')[0].decode('utf-8', errors='replace')
-                if '200' in status_line:
-                    client_sock.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-                    self._relay(client_sock, upstream_sock)
-                else:
-                    client_sock.sendall(response)
-            else:
-                header_end = request_data.index(b'\r\n\r\n')
-                headers_part = request_data[:header_end].decode('utf-8', errors='replace')
-                body_part = request_data[header_end + 4:]
-
-                lines = headers_part.split('\r\n')
-                new_request = lines[0] + '\r\n'
-                if auth_header:
-                    new_request += auth_header
-                for line in lines[1:]:
-                    if line.lower().startswith('proxy-authorization'):
-                        continue
-                    new_request += line + '\r\n'
-                new_request += '\r\n'
-
-                upstream_sock.sendall(new_request.encode() + body_part)
-                self._relay(client_sock, upstream_sock)
-
-        except Exception:
-            pass
-        finally:
-            for s in [client_sock, upstream_sock]:
-                if s:
-                    try:
-                        s.close()
-                    except Exception:
-                        pass
-
-    def _relay(self, sock1, sock2):
-        sockets = [sock1, sock2]
-        try:
-            while True:
-                readable, _, errored = select.select(sockets, [], sockets, 30)
-                if errored:
-                    break
-                if not readable:
-                    break
-                for s in readable:
-                    data = s.recv(8192)
-                    if not data:
-                        return
-                    target = sock2 if s is sock1 else sock1
-                    target.sendall(data)
-        except Exception:
-            pass
-        finally:
-            for s in sockets:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+def api_get(path):
+    try:
+        url = API_BASE + path
+        req = urllib.request.Request(url, method='GET')
+        req.add_header('Content-Type', 'application/json')
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return {'code': -1, 'msg': str(e)}
 
 
-class RelayApp:
+def api_post(path, data=None):
+    try:
+        url = API_BASE + path
+        body = json.dumps(data or {}).encode('utf-8')
+        req = urllib.request.Request(url, data=body, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        return {'code': -1, 'msg': str(e)}
+
+
+class ProxyRotatorApp:
     def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(f'ProxyRotator v{VERSION}')
+        self.root.geometry('580x520')
+        self.root.resizable(True, True)
+        self.root.configure(bg='#1a1a2e')
+
         self.proxies = []
-        self.current_proxy = None
-        self.connected = False
-        self.config = load_config()
-        self.forwarder = ProxyForwarder(self.config.get('proxy_port', 8899))
-        self.api_server = None
-        self.log_lines = []
+        self.profiles = []
+        self.profile_proxies = {}
+        self.profile_widgets = {}
 
         self._load_proxies()
-        self._start_api()
-        self.forwarder.start()
         self._build_ui()
+        self._refresh_profiles()
+
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
         line = f'[{ts}] {msg}'
-        self.log_lines.append(line)
-        if len(self.log_lines) > 200:
-            self.log_lines = self.log_lines[-100:]
         print(line)
         if hasattr(self, 'log_text'):
             self.log_text.configure(state='normal')
@@ -292,261 +120,252 @@ class RelayApp:
         path = get_proxies_path()
         if os.path.exists(path):
             self.proxies = load_proxies_from_file(path)
-            self._log(f'Loaded {len(self.proxies)} proxies')
+            print(f'Loaded {len(self.proxies)} proxies from {path}')
         else:
-            self._log('No proxies.txt found - place it next to this .exe')
-
-    def _save_proxies(self, proxy_lines):
-        path = get_proxies_path()
-        try:
-            with open(path, 'w') as f:
-                f.write(proxy_lines)
-            self.proxies = load_proxies_from_file(path)
-            self._log(f'Saved {len(self.proxies)} proxies')
-        except Exception as e:
-            self._log(f'Save error: {e}')
-
-    def connect(self, proxy=None):
-        if not self.proxies:
-            self._log('No proxies loaded')
-            return False
-
-        if proxy is None:
-            proxy = random.choice(self.proxies)
-
-        self.forwarder.set_upstream(
-            proxy['host'], proxy['port'],
-            proxy.get('username'), proxy.get('password')
-        )
-
-        if not self.forwarder.running:
-            self.forwarder.start()
-
-        self.current_proxy = proxy
-        self.connected = True
-        display = f"{proxy['host']}:{proxy['port']}"
-        self._log(f'Upstream -> {display}')
-        self._update_ui()
-        return True
-
-    def rotate(self):
-        if not self.proxies:
-            self._log('No proxies to rotate')
-            return False
-
-        if len(self.proxies) > 1 and self.current_proxy:
-            available = [p for p in self.proxies
-                         if p['host'] != self.current_proxy['host'] or
-                            p['port'] != self.current_proxy['port']]
-            proxy = random.choice(available) if available else random.choice(self.proxies)
-        else:
-            proxy = random.choice(self.proxies)
-
-        return self.connect(proxy)
-
-    def disconnect(self):
-        self.forwarder.set_upstream(None, None)
-        self.current_proxy = None
-        self.connected = False
-        self._log('Disconnected - no upstream')
-        self._update_ui()
-
-    def get_status(self):
-        return {
-            'connected': self.connected,
-            'proxy': f"{self.current_proxy['host']}:{self.current_proxy['port']}" if self.current_proxy else None,
-            'proxy_count': len(self.proxies),
-            'proxy_port': self.config.get('proxy_port', 8899),
-            'version': VERSION
-        }
-
-    def _start_api(self):
-        app = self
-        api_port = self.config.get('api_port', 8900)
-
-        class APIHandler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):
-                pass
-
-            def _cors(self):
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-                self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-
-            def _json_response(self, data, code=200):
-                self.send_response(code)
-                self._cors()
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(data).encode())
-
-            def do_OPTIONS(self):
-                self.send_response(204)
-                self._cors()
-                self.end_headers()
-
-            def do_GET(self):
-                if self.path == '/status':
-                    self._json_response(app.get_status())
-                elif self.path == '/proxies':
-                    lines = []
-                    for p in app.proxies:
-                        if p.get('username') and p.get('password'):
-                            lines.append(f"{p['host']}:{p['port']}:{p['username']}:{p['password']}")
-                        else:
-                            lines.append(f"{p['host']}:{p['port']}")
-                    self._json_response({'proxies': lines, 'count': len(lines)})
-                else:
-                    self._json_response({'error': 'not found'}, 404)
-
-            def do_POST(self):
-                if self.path == '/connect':
-                    ok = app.connect()
-                    self._json_response({'success': ok, 'status': app.get_status()})
-                elif self.path == '/rotate':
-                    ok = app.rotate()
-                    self._json_response({'success': ok, 'status': app.get_status()})
-                elif self.path == '/disconnect':
-                    app.disconnect()
-                    self._json_response({'success': True, 'status': app.get_status()})
-                elif self.path == '/proxies':
-                    length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(length).decode('utf-8', errors='replace')
-                    try:
-                        data = json.loads(body)
-                        proxy_text = data.get('proxies', '')
-                        app._save_proxies(proxy_text)
-                        self._json_response({'success': True, 'count': len(app.proxies)})
-                    except Exception as e:
-                        self._json_response({'success': False, 'error': str(e)}, 400)
-                else:
-                    self._json_response({'error': 'not found'}, 404)
-
-        def run_api():
-            try:
-                server = HTTPServer(('127.0.0.1', api_port), APIHandler)
-                self.api_server = server
-                self._log(f'API listening on 127.0.0.1:{api_port}')
-                server.serve_forever()
-            except Exception as e:
-                self._log(f'API error: {e}')
-
-        t = threading.Thread(target=run_api, daemon=True)
-        t.start()
+            print(f'No proxies.txt at {path}')
 
     def _build_ui(self):
-        self.root = tk.Tk()
-        self.root.title(f'ProxyRelay v{VERSION}')
-        self.root.geometry('380x420')
-        self.root.resizable(False, False)
-        self.root.configure(bg='#1a1a2e')
-
-        try:
-            self.root.iconbitmap(default='')
-        except Exception:
-            pass
-
         # Title
         tf = tk.Frame(self.root, bg='#1a1a2e')
         tf.pack(fill='x', padx=15, pady=(10, 5))
-        tk.Label(tf, text='PROXY RELAY', font=('Segoe UI', 16, 'bold'),
+        tk.Label(tf, text='PROXY ROTATOR', font=('Segoe UI', 16, 'bold'),
                  fg='#e94560', bg='#1a1a2e').pack()
-        tk.Label(tf, text=f'v{VERSION} - Local proxy forwarder for AdsPower',
+        tk.Label(tf, text=f'v{VERSION} - Per-profile proxy rotation for AdsPower',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
 
-        # Status
-        sf = tk.Frame(self.root, bg='#16213e', highlightbackground='#0f3460', highlightthickness=1)
-        sf.pack(fill='x', padx=15, pady=8)
-        self.status_label = tk.Label(sf, text='NOT CONNECTED', font=('Segoe UI', 13, 'bold'),
-                                     fg='#ff6b6b', bg='#16213e')
-        self.status_label.pack(pady=(10, 2))
-        self.proxy_label = tk.Label(sf, text='No upstream proxy', font=('Consolas', 10),
-                                    fg='#8888aa', bg='#16213e')
-        self.proxy_label.pack(pady=(0, 4))
-        self.count_label = tk.Label(sf, text=f'Proxies: {len(self.proxies)}',
-                                     font=('Segoe UI', 9), fg='#8888aa', bg='#16213e')
-        self.count_label.pack(pady=(0, 10))
+        # Proxy count + buttons
+        cf = tk.Frame(self.root, bg='#1a1a2e')
+        cf.pack(fill='x', padx=15, pady=5)
 
-        # Port info
-        pf = tk.Frame(self.root, bg='#1a1a2e')
-        pf.pack(fill='x', padx=15, pady=2)
-        proxy_port = self.config.get('proxy_port', 8899)
-        api_port = self.config.get('api_port', 8900)
-        tk.Label(pf, text=f'Proxy: 127.0.0.1:{proxy_port}  |  API: 127.0.0.1:{api_port}',
-                 font=('Consolas', 8), fg='#666', bg='#1a1a2e').pack()
+        self.count_label = tk.Label(cf, text=f'Proxies: {len(self.proxies)}',
+                                     font=('Segoe UI', 10, 'bold'),
+                                     fg='#44dd44' if self.proxies else '#ff6b6b',
+                                     bg='#1a1a2e')
+        self.count_label.pack(side='left')
 
-        # Buttons
-        bf = tk.Frame(self.root, bg='#1a1a2e')
-        bf.pack(fill='x', padx=15, pady=8)
+        tk.Button(cf, text='Load proxies.txt', font=('Segoe UI', 8),
+                  fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
+                  cursor='hand2', command=self._browse_proxies).pack(side='right', padx=4)
 
-        self.connect_btn = tk.Button(bf, text='CONNECT', font=('Segoe UI', 11, 'bold'),
-                                      fg='#ffffff', bg='#4CAF50', activebackground='#66BB6A',
-                                      activeforeground='#ffffff', border=0, pady=8,
-                                      cursor='hand2', command=self._on_connect)
-        self.connect_btn.pack(fill='x', pady=2)
+        tk.Button(cf, text='Refresh Profiles', font=('Segoe UI', 8),
+                  fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
+                  cursor='hand2', command=self._refresh_profiles).pack(side='right', padx=4)
 
-        self.rotate_btn = tk.Button(bf, text='ROTATE PROXY', font=('Segoe UI', 10, 'bold'),
-                                     fg='#ffffff', bg='#FF9800', activebackground='#FFB74D',
-                                     activeforeground='#ffffff', border=0, pady=6,
-                                     cursor='hand2', command=self._on_rotate, state='disabled')
-        self.rotate_btn.pack(fill='x', pady=2)
+        # Profiles list header
+        hf = tk.Frame(self.root, bg='#0f3460')
+        hf.pack(fill='x', padx=15, pady=(8, 0))
+        tk.Label(hf, text='Profile', font=('Segoe UI', 9, 'bold'), fg='#fff',
+                 bg='#0f3460', width=20, anchor='w').pack(side='left', padx=(8, 0))
+        tk.Label(hf, text='Current Proxy', font=('Segoe UI', 9, 'bold'), fg='#fff',
+                 bg='#0f3460', width=25, anchor='w').pack(side='left')
+        tk.Label(hf, text='', font=('Segoe UI', 9), bg='#0f3460',
+                 width=10).pack(side='right', padx=4)
 
-        self.disconnect_btn = tk.Button(bf, text='DISCONNECT', font=('Segoe UI', 10, 'bold'),
-                                         fg='#ffffff', bg='#f44336', activebackground='#EF5350',
-                                         activeforeground='#ffffff', border=0, pady=6,
-                                         cursor='hand2', command=self._on_disconnect, state='disabled')
-        self.disconnect_btn.pack(fill='x', pady=2)
+        # Scrollable profiles area
+        canvas_frame = tk.Frame(self.root, bg='#1a1a2e')
+        canvas_frame.pack(fill='both', expand=True, padx=15, pady=(0, 5))
 
-        # Log
+        self.canvas = tk.Canvas(canvas_frame, bg='#16213e', highlightthickness=0)
+        scrollbar = tk.Scrollbar(canvas_frame, orient='vertical', command=self.canvas.yview)
+        self.profiles_frame = tk.Frame(self.canvas, bg='#16213e')
+
+        self.profiles_frame.bind('<Configure>',
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
+
+        self.canvas.create_window((0, 0), window=self.profiles_frame, anchor='nw')
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # No profiles message
+        self.no_profiles_label = tk.Label(self.profiles_frame,
+            text='No active profiles found.\nStart some profiles in AdsPower first.',
+            font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
+
+        # Log area
         lf = tk.Frame(self.root, bg='#1a1a2e')
-        lf.pack(fill='both', expand=True, padx=15, pady=(4, 10))
+        lf.pack(fill='x', padx=15, pady=(0, 10))
         tk.Label(lf, text='Log', font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack(anchor='w')
-        self.log_text = tk.Text(lf, height=5, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
+        self.log_text = tk.Text(lf, height=4, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
                                 insertbackground='#44dd44', border=0, wrap='word', state='disabled')
-        self.log_text.pack(fill='both', expand=True, pady=2)
+        self.log_text.pack(fill='x', pady=2)
 
-        for line in self.log_lines:
-            self.log_text.configure(state='normal')
-            self.log_text.insert('end', line + '\n')
-            self.log_text.configure(state='disabled')
+        if self.proxies:
+            self._log(f'Loaded {len(self.proxies)} proxies')
+        else:
+            path = get_proxies_path()
+            self._log(f'No proxies.txt found at: {path}')
+            self._log('Click "Load proxies.txt" or place the file next to this .exe')
 
-        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+    def _browse_proxies(self):
+        filepath = filedialog.askopenfilename(
+            title='Select Proxy List',
+            filetypes=[('Text files', '*.txt'), ('All files', '*.*')]
+        )
+        if filepath:
+            self.proxies = load_proxies_from_file(filepath)
+            self.count_label.configure(
+                text=f'Proxies: {len(self.proxies)}',
+                fg='#44dd44' if self.proxies else '#ff6b6b')
+            self._log(f'Loaded {len(self.proxies)} proxies from {os.path.basename(filepath)}')
 
-    def _update_ui(self):
-        if not hasattr(self, 'status_label'):
+    def _refresh_profiles(self):
+        def do_refresh():
+            self._log('Fetching active profiles from AdsPower...')
+
+            resp = api_get('/api/v1/browser/active?page=1&page_size=100')
+            if resp.get('code') != 0:
+                self._log(f'AdsPower API error: {resp.get("msg", "unknown")}')
+                self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
+                return
+
+            data = resp.get('data', {})
+            profile_list = data.get('list', [])
+            if not profile_list:
+                self._log('No active profiles found')
+                self.root.after(0, lambda: self.no_profiles_label.pack(pady=20))
+                return
+
+            self.profiles = []
+            for p in profile_list:
+                user_id = p.get('user_id', '')
+                serial = p.get('serial_number', '')
+                name = p.get('name', '') or p.get('remark', '') or serial or user_id
+
+                profile_resp = api_get(f'/api/v1/user/list?user_id={user_id}')
+                current_proxy = 'unknown'
+                if profile_resp.get('code') == 0:
+                    plist = profile_resp.get('data', {}).get('list', [])
+                    if plist:
+                        proxy_cfg = plist[0].get('user_proxy_config', {})
+                        ph = proxy_cfg.get('proxy_host', '')
+                        pp = proxy_cfg.get('proxy_port', '')
+                        if ph:
+                            current_proxy = f'{ph}:{pp}'
+                        else:
+                            current_proxy = 'no proxy'
+
+                self.profiles.append({
+                    'user_id': user_id,
+                    'serial': serial,
+                    'name': name,
+                    'current_proxy': current_proxy
+                })
+
+            self._log(f'Found {len(self.profiles)} active profiles')
+            self.root.after(0, self._render_profiles)
+
+        threading.Thread(target=do_refresh, daemon=True).start()
+
+    def _render_profiles(self):
+        for w in self.profiles_frame.winfo_children():
+            w.destroy()
+        self.profile_widgets = {}
+
+        if not self.profiles:
+            self.no_profiles_label = tk.Label(self.profiles_frame,
+                text='No active profiles found.\nStart some profiles in AdsPower first.',
+                font=('Segoe UI', 10), fg='#666', bg='#16213e', pady=20)
+            self.no_profiles_label.pack()
             return
-        try:
-            if self.connected and self.current_proxy:
-                self.status_label.configure(text='CONNECTED', fg='#4CAF50')
-                self.proxy_label.configure(
-                    text=f"{self.current_proxy['host']}:{self.current_proxy['port']}",
-                    fg='#44dd44')
-                self.connect_btn.configure(state='disabled')
-                self.rotate_btn.configure(state='normal')
-                self.disconnect_btn.configure(state='normal')
+
+        for i, profile in enumerate(self.profiles):
+            bg = '#1a2744' if i % 2 == 0 else '#16213e'
+            row = tk.Frame(self.profiles_frame, bg=bg)
+            row.pack(fill='x', padx=2, pady=1)
+
+            display_name = profile['serial'] or profile['name']
+            if len(display_name) > 18:
+                display_name = display_name[:18] + '..'
+
+            name_lbl = tk.Label(row, text=display_name, font=('Consolas', 9),
+                                fg='#ddd', bg=bg, width=20, anchor='w')
+            name_lbl.pack(side='left', padx=(8, 0))
+
+            proxy_lbl = tk.Label(row, text=profile['current_proxy'],
+                                 font=('Consolas', 9), fg='#8888aa', bg=bg,
+                                 width=25, anchor='w')
+            proxy_lbl.pack(side='left')
+
+            uid = profile['user_id']
+            rotate_btn = tk.Button(row, text='ROTATE', font=('Segoe UI', 8, 'bold'),
+                                    fg='#fff', bg='#FF9800', activebackground='#FFB74D',
+                                    activeforeground='#fff', border=0, padx=10, pady=2,
+                                    cursor='hand2',
+                                    command=lambda u=uid: self._rotate_profile(u))
+            rotate_btn.pack(side='right', padx=6, pady=3)
+
+            self.profile_widgets[uid] = {
+                'name_lbl': name_lbl,
+                'proxy_lbl': proxy_lbl,
+                'rotate_btn': rotate_btn,
+                'row': row
+            }
+
+        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+
+    def _rotate_profile(self, user_id):
+        if not self.proxies:
+            self._log('No proxies loaded! Load proxies.txt first.')
+            messagebox.showwarning('No Proxies', 'Load proxies.txt first.')
+            return
+
+        widgets = self.profile_widgets.get(user_id)
+        if widgets:
+            widgets['rotate_btn'].configure(state='disabled', text='...')
+            widgets['proxy_lbl'].configure(text='rotating...', fg='#FFD700')
+
+        def do_rotate():
+            proxy = random.choice(self.proxies)
+            display = f"{proxy['host']}:{proxy['port']}"
+            self._log(f'Rotating {user_id} -> {display}')
+
+            proxy_config = {
+                'proxy_soft': 'other',
+                'proxy_type': 'http',
+                'proxy_host': proxy['host'],
+                'proxy_port': str(proxy['port']),
+                'proxy_user': proxy.get('username', ''),
+                'proxy_password': proxy.get('password', '')
+            }
+
+            resp = api_post('/api/v1/user/update', {
+                'user_id': user_id,
+                'user_proxy_config': proxy_config
+            })
+
+            if resp.get('code') != 0:
+                self._log(f'Update failed: {resp.get("msg", "unknown")}')
+                self.root.after(0, lambda: self._update_profile_ui(user_id, 'FAILED', '#ff4444'))
+                return
+
+            self._log(f'Proxy updated for {user_id}. Restarting browser...')
+
+            stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id})
+            if stop_resp.get('code') != 0:
+                self._log(f'Stop warning: {stop_resp.get("msg", "")}')
+
+            time.sleep(1.5)
+
+            start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}')
+            if start_resp.get('code') == 0:
+                self._log(f'Profile {user_id} restarted with {display}')
+                self.root.after(0, lambda: self._update_profile_ui(user_id, display, '#44dd44'))
             else:
-                self.status_label.configure(text='NOT CONNECTED', fg='#ff6b6b')
-                self.proxy_label.configure(text='No upstream proxy', fg='#8888aa')
-                self.connect_btn.configure(state='normal')
-                self.rotate_btn.configure(state='disabled')
-                self.disconnect_btn.configure(state='disabled')
-            self.count_label.configure(text=f'Proxies: {len(self.proxies)}')
-        except Exception:
-            pass
+                self._log(f'Start failed: {start_resp.get("msg", "")}')
+                self._log(f'Proxy was updated to {display} - restart manually in AdsPower')
+                self.root.after(0, lambda: self._update_profile_ui(user_id, f'{display} (restart)', '#FFD700'))
 
-    def _on_connect(self):
-        self.connect()
+        threading.Thread(target=do_rotate, daemon=True).start()
 
-    def _on_rotate(self):
-        self.rotate()
-
-    def _on_disconnect(self):
-        self.disconnect()
+    def _update_profile_ui(self, user_id, proxy_text, color):
+        widgets = self.profile_widgets.get(user_id)
+        if widgets:
+            widgets['proxy_lbl'].configure(text=proxy_text, fg=color)
+            widgets['rotate_btn'].configure(state='normal', text='ROTATE')
 
     def _on_close(self):
-        self.forwarder.stop()
-        if self.api_server:
-            self.api_server.shutdown()
         self.root.destroy()
 
     def run(self):
@@ -554,5 +373,5 @@ class RelayApp:
 
 
 if __name__ == '__main__':
-    app = RelayApp()
+    app = ProxyRotatorApp()
     app.run()
