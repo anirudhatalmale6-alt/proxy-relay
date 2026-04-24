@@ -1,10 +1,9 @@
 """
-ProxyRotator v2.5 - Per-Profile Proxy Rotation for AdsPower
-Search by serial number. Tries multiple methods to rotate proxy.
-Each profile gets its own ROTATE button.
+ProxyRotator v3.0 - Per-Profile Proxy Rotation for AdsPower
+ROTATE = change proxy setting (close & reopen profile to apply)
+RESTORE = put back the original proxy
 
 Place proxies.txt next to this .exe (format: host:port:user:pass)
-Requires AdsPower API Key (Settings > Security > API Key)
 """
 
 import tkinter as tk
@@ -23,7 +22,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "2.7"
+VERSION = "3.0"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 
@@ -90,11 +89,8 @@ def load_proxies_from_file(filepath):
     return proxies
 
 
-def api_get(path, api_key=''):
+def api_get(path):
     try:
-        if api_key:
-            sep = '&' if '?' in path else '?'
-            path = f'{path}{sep}api_key={api_key}'
         url = API_BASE + path
         req = urllib.request.Request(url, method='GET')
         req.add_header('Content-Type', 'application/json')
@@ -104,11 +100,8 @@ def api_get(path, api_key=''):
         return {'code': -1, 'msg': str(e)}
 
 
-def api_post(path, data=None, api_key=''):
+def api_post(path, data=None):
     try:
-        if api_key:
-            sep = '&' if '?' in path else '?'
-            path = f'{path}{sep}api_key={api_key}'
         url = API_BASE + path
         body = json.dumps(data or {}).encode('utf-8')
         req = urllib.request.Request(url, data=body, method='POST')
@@ -123,16 +116,15 @@ class ProxyRotatorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f'ProxyRotator v{VERSION}')
-        self.root.geometry('580x520')
+        self.root.geometry('620x520')
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
 
         self.proxies = []
         self.profiles = []
         self.profile_widgets = {}
-        self.api_key = ''
+        self.original_proxies = {}
 
-        self._load_config()
         self._load_proxies()
         self._build_ui()
 
@@ -147,22 +139,6 @@ class ProxyRotatorApp:
             self.log_text.insert('end', line + '\n')
             self.log_text.see('end')
             self.log_text.configure(state='disabled')
-
-    def _load_config(self):
-        cfg = load_config()
-        self.api_key = cfg.get('api_key', '')
-
-    def _save_api_key(self):
-        self.api_key = self.api_key_var.get().strip()
-        cfg = load_config()
-        cfg['api_key'] = self.api_key
-        save_config(cfg)
-        if self.api_key:
-            self._log(f'API key saved ({len(self.api_key)} chars)')
-            self.key_status.configure(text='Saved', fg='#44dd44')
-        else:
-            self._log('API key cleared')
-            self.key_status.configure(text='No key', fg='#ff6b6b')
 
     def _load_proxies(self):
         path = get_proxies_path()
@@ -181,28 +157,6 @@ class ProxyRotatorApp:
         tk.Label(tf, text=f'v{VERSION} - Per-profile proxy rotation for AdsPower',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
 
-        # API Key row
-        kf = tk.Frame(self.root, bg='#1a1a2e')
-        kf.pack(fill='x', padx=15, pady=(5, 2))
-
-        tk.Label(kf, text='API Key:', font=('Segoe UI', 9, 'bold'),
-                 fg='#ddd', bg='#1a1a2e').pack(side='left')
-
-        self.api_key_var = tk.StringVar(value=self.api_key)
-        key_entry = tk.Entry(kf, textvariable=self.api_key_var, font=('Consolas', 9),
-                             bg='#0a0a1a', fg='#44dd44', insertbackground='#44dd44',
-                             border=1, relief='solid', width=30, show='*')
-        key_entry.pack(side='left', padx=(6, 4), fill='x', expand=True)
-
-        tk.Button(kf, text='Save', font=('Segoe UI', 8),
-                  fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
-                  cursor='hand2', command=self._save_api_key).pack(side='left', padx=2)
-
-        self.key_status = tk.Label(kf, font=('Segoe UI', 8, 'bold'), bg='#1a1a2e',
-                                    text='Saved' if self.api_key else 'No key',
-                                    fg='#44dd44' if self.api_key else '#ff6b6b')
-        self.key_status.pack(side='left', padx=4)
-
         # Proxy count + load button
         cf = tk.Frame(self.root, bg='#1a1a2e')
         cf.pack(fill='x', padx=15, pady=5)
@@ -217,7 +171,7 @@ class ProxyRotatorApp:
                   fg='#fff', bg='#0f3460', border=0, padx=8, pady=2,
                   cursor='hand2', command=self._browse_proxies).pack(side='right', padx=4)
 
-        # Search row - main interaction
+        # Search row
         sf = tk.Frame(self.root, bg='#1a1a2e')
         sf.pack(fill='x', padx=15, pady=(8, 2))
 
@@ -237,19 +191,26 @@ class ProxyRotatorApp:
                   cursor='hand2', command=self._do_search)
         self.search_btn.pack(side='left', padx=4)
 
-        tk.Label(sf, text='Enter serial numbers\nseparated by commas',
-                 font=('Segoe UI', 7), fg='#666', bg='#1a1a2e', justify='left').pack(side='left', padx=8)
+        tk.Label(sf, text='e.g. 27764, 27763',
+                 font=('Segoe UI', 8), fg='#666', bg='#1a1a2e').pack(side='left', padx=8)
+
+        # Info bar
+        self.info_label = tk.Label(self.root, text='ROTATE = change proxy | RESTORE = put back original | Close & reopen profile to apply',
+                 font=('Segoe UI', 8), fg='#FFD700', bg='#0f3460', pady=3)
+        self.info_label.pack(fill='x', padx=15, pady=(5, 0))
 
         # Profiles list header
         hf = tk.Frame(self.root, bg='#0f3460')
-        hf.pack(fill='x', padx=15, pady=(8, 0))
+        hf.pack(fill='x', padx=15, pady=(0, 0))
         self.header_label = tk.Label(hf, text='Profile', font=('Segoe UI', 9, 'bold'),
-                 fg='#fff', bg='#0f3460', width=20, anchor='w')
+                 fg='#fff', bg='#0f3460', width=12, anchor='w')
         self.header_label.pack(side='left', padx=(8, 0))
-        tk.Label(hf, text='Current Proxy', font=('Segoe UI', 9, 'bold'), fg='#fff',
-                 bg='#0f3460', width=25, anchor='w').pack(side='left')
+        tk.Label(hf, text='Original Proxy', font=('Segoe UI', 9, 'bold'), fg='#fff',
+                 bg='#0f3460', width=18, anchor='w').pack(side='left')
+        tk.Label(hf, text='Status', font=('Segoe UI', 9, 'bold'), fg='#fff',
+                 bg='#0f3460', width=18, anchor='w').pack(side='left')
         tk.Label(hf, text='', font=('Segoe UI', 9), bg='#0f3460',
-                 width=10).pack(side='right', padx=4)
+                 width=16).pack(side='right', padx=4)
 
         # Scrollable profiles area
         canvas_frame = tk.Frame(self.root, bg='#1a1a2e')
@@ -272,7 +233,7 @@ class ProxyRotatorApp:
         tk.Label(self.profiles_frame,
             text='Enter serial number(s) above and click FIND\n\n'
                  'Example: 27764\n'
-                 'Multiple: 27764, 27763, 27762, 27761',
+                 'Multiple: 27764, 27763, 27762',
             font=('Segoe UI', 10), fg='#888', bg='#16213e', pady=30).pack()
 
         # Log area
@@ -289,11 +250,6 @@ class ProxyRotatorApp:
             path = get_proxies_path()
             self._log(f'No proxies.txt found at: {path}')
             self._log('Click "Load proxies.txt" or place the file next to this .exe')
-
-        if self.api_key:
-            self._log(f'API key loaded from config')
-        else:
-            self._log('No API key set - enter your AdsPower API key above')
 
     def _browse_proxies(self):
         filepath = filedialog.askopenfilename(
@@ -323,8 +279,7 @@ class ProxyRotatorApp:
         def do_search():
             found = []
             for serial in serials:
-                resp = api_get(f'/api/v1/user/list?serial_number={serial}',
-                               api_key=self.api_key)
+                resp = api_get(f'/api/v1/user/list?serial_number={serial}')
                 if resp.get('code') == 0:
                     data = resp.get('data', {})
                     profiles = data.get('list', [])
@@ -340,6 +295,8 @@ class ProxyRotatorApp:
                         pp = proxy_cfg.get('proxy_port', '')
                         current_proxy = f'{ph}:{pp}' if ph else 'no proxy'
 
+                        self.original_proxies[user_id] = dict(proxy_cfg)
+
                         found.append({
                             'user_id': user_id,
                             'serial': str(sn),
@@ -351,7 +308,8 @@ class ProxyRotatorApp:
 
             if not found:
                 self._log(f'No profiles found for: {", ".join(serials)}')
-                self._log('Make sure you entered the correct serial number')
+            else:
+                self._log(f'Found {len(found)} profile(s). Original proxies saved.')
 
             self.profiles = found
             self.root.after(0, self._render_profiles)
@@ -378,92 +336,59 @@ class ProxyRotatorApp:
             row.pack(fill='x', padx=2, pady=1)
 
             display_name = profile['serial'] or profile['name']
-            if len(display_name) > 18:
-                display_name = display_name[:18] + '..'
+            if len(display_name) > 10:
+                display_name = display_name[:10] + '..'
 
             name_lbl = tk.Label(row, text=display_name, font=('Consolas', 9),
-                                fg='#ddd', bg=bg, width=20, anchor='w')
+                                fg='#ddd', bg=bg, width=12, anchor='w')
             name_lbl.pack(side='left', padx=(8, 0))
 
-            proxy_lbl = tk.Label(row, text=profile['current_proxy'],
-                                 font=('Consolas', 9), fg='#8888aa', bg=bg,
-                                 width=25, anchor='w')
-            proxy_lbl.pack(side='left')
+            orig_proxy = profile['current_proxy']
+            if len(orig_proxy) > 18:
+                orig_proxy = orig_proxy[:18] + '..'
+            orig_lbl = tk.Label(row, text=orig_proxy,
+                                font=('Consolas', 8), fg='#8888aa', bg=bg,
+                                width=18, anchor='w')
+            orig_lbl.pack(side='left')
+
+            status_lbl = tk.Label(row, text='original',
+                                   font=('Consolas', 9), fg='#8888aa', bg=bg,
+                                   width=18, anchor='w')
+            status_lbl.pack(side='left')
 
             uid = profile['user_id']
+
+            restore_btn = tk.Button(row, text='RESTORE', font=('Segoe UI', 8, 'bold'),
+                                     fg='#fff', bg='#4CAF50', activebackground='#66BB6A',
+                                     activeforeground='#fff', border=0, padx=6, pady=2,
+                                     cursor='hand2', state='disabled',
+                                     command=lambda u=uid: self._restore_profile(u))
+            restore_btn.pack(side='right', padx=3, pady=3)
+
             rotate_btn = tk.Button(row, text='ROTATE', font=('Segoe UI', 8, 'bold'),
                                     fg='#fff', bg='#FF9800', activebackground='#FFB74D',
-                                    activeforeground='#fff', border=0, padx=10, pady=2,
+                                    activeforeground='#fff', border=0, padx=6, pady=2,
                                     cursor='hand2',
                                     command=lambda u=uid: self._rotate_profile(u))
-            rotate_btn.pack(side='right', padx=6, pady=3)
+            rotate_btn.pack(side='right', padx=3, pady=3)
 
             self.profile_widgets[uid] = {
                 'name_lbl': name_lbl,
-                'proxy_lbl': proxy_lbl,
+                'orig_lbl': orig_lbl,
+                'status_lbl': status_lbl,
                 'rotate_btn': rotate_btn,
+                'restore_btn': restore_btn,
                 'row': row
             }
 
         self.canvas.configure(scrollregion=self.canvas.bbox('all'))
 
-    def _try_update_proxy(self, user_id, proxy_config):
-        self._log('Method 1: user/update without API key...')
+    def _update_proxy(self, user_id, proxy_config):
         resp = api_post('/api/v1/user/update', {
             'user_id': user_id,
             'user_proxy_config': proxy_config
         })
-        if resp.get('code') == 0:
-            return True, 'update_no_key'
-
-        self._log(f'Method 1 failed: {resp.get("msg", "")}')
-
-        if self.api_key:
-            self._log('Method 2: user/update with API key...')
-            resp = api_post('/api/v1/user/update', {
-                'user_id': user_id,
-                'user_proxy_config': proxy_config
-            }, api_key=self.api_key)
-            if resp.get('code') == 0:
-                return True, 'update_with_key'
-            self._log(f'Method 2 failed: {resp.get("msg", "")}')
-
-        self._log('Method 3: stop + start with proxy config...')
-        stop_resp = api_post('/api/v1/browser/stop', {'user_id': user_id},
-                             api_key=self.api_key)
-        self._log(f'Stop: {stop_resp.get("msg", "ok") if stop_resp.get("code") != 0 else "ok"}')
-        time.sleep(1.5)
-
-        proxy_json = json.dumps(proxy_config)
-        encoded = urllib.parse.quote(proxy_json)
-        start_resp = api_get(
-            f'/api/v1/browser/start?user_id={user_id}&user_proxy_config={encoded}',
-            api_key=self.api_key)
-        if start_resp.get('code') == 0:
-            return True, 'start_with_proxy'
-        self._log(f'Method 3 failed: {start_resp.get("msg", "")}')
-
-        self._log('Method 4: stop + start with launch args...')
-        proxy_host = proxy_config.get('proxy_host', '')
-        proxy_port = proxy_config.get('proxy_port', '')
-        proxy_user = proxy_config.get('proxy_user', '')
-        proxy_pass = proxy_config.get('proxy_password', '')
-
-        if proxy_user:
-            proxy_url = f'http://{proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}'
-        else:
-            proxy_url = f'http://{proxy_host}:{proxy_port}'
-
-        launch_args = json.dumps([f'--proxy-server={proxy_url}'])
-        encoded_args = urllib.parse.quote(launch_args)
-        start_resp2 = api_get(
-            f'/api/v1/browser/start?user_id={user_id}&launch_args={encoded_args}',
-            api_key=self.api_key)
-        if start_resp2.get('code') == 0:
-            return True, 'start_with_args'
-        self._log(f'Method 4 failed: {start_resp2.get("msg", "")}')
-
-        return False, None
+        return resp.get('code') == 0, resp.get('msg', 'unknown')
 
     def _rotate_profile(self, user_id):
         if not self.proxies:
@@ -474,7 +399,7 @@ class ProxyRotatorApp:
         widgets = self.profile_widgets.get(user_id)
         if widgets:
             widgets['rotate_btn'].configure(state='disabled', text='...')
-            widgets['proxy_lbl'].configure(text='rotating...', fg='#FFD700')
+            widgets['status_lbl'].configure(text='rotating...', fg='#FFD700')
 
         def do_rotate():
             proxy = random.choice(self.proxies)
@@ -490,66 +415,69 @@ class ProxyRotatorApp:
                 'proxy_password': proxy.get('password', '')
             }
 
-            success, method = self._try_update_proxy(user_id, proxy_config)
+            ok, msg = self._update_proxy(user_id, proxy_config)
 
-            if not success:
-                self._log(f'All methods failed for {user_id}')
-                self._log('Try: AdsPower > API & MCP > Enable "API verification"')
-                self.root.after(0, lambda: self._update_profile_ui(user_id, 'FAILED', '#ff4444'))
-                return
-
-            self._log(f'Success via {method}!')
-
-            if method.startswith('update'):
-                self._log(f'Proxy updated. Closing browser...')
-                stopped = False
-                for stop_method in [
-                    lambda: api_get(f'/api/v1/browser/stop?user_id={user_id}'),
-                    lambda: api_post('/api/v1/browser/stop', {'user_id': user_id}),
-                    lambda: api_get(f'/api/v1/browser/stop?user_id={user_id}',
-                                     api_key=self.api_key),
-                    lambda: api_post('/api/v1/browser/stop', {'user_id': user_id},
-                                     api_key=self.api_key),
-                ]:
-                    resp = stop_method()
-                    if resp.get('code') == 0:
-                        self._log('Browser stopped')
-                        stopped = True
-                        break
-
-                if not stopped:
-                    self._log('Could not stop browser automatically')
-                    self._log('Please close the profile manually in AdsPower, then reopen it')
-                    self.root.after(0, lambda: self._update_profile_ui(
-                        user_id, f'{display} (close & reopen)', '#FFD700'))
-                    return
-
-                time.sleep(2)
-                self._log('Reopening browser...')
-                start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}')
-                if start_resp.get('code') != 0:
-                    start_resp = api_get(f'/api/v1/browser/start?user_id={user_id}',
-                                         api_key=self.api_key)
-                if start_resp.get('code') == 0:
-                    self._log(f'Profile {user_id} restarted with {display}')
-                else:
-                    self._log(f'Reopen failed - open profile manually in AdsPower')
-                    self._log(f'Proxy IS updated to {display}')
-                    self.root.after(0, lambda: self._update_profile_ui(
-                        user_id, f'{display} (reopen manually)', '#FFD700'))
-                    return
+            if ok:
+                self._log(f'Proxy set to {display}')
+                self._log('Close & reopen the profile in AdsPower to use the new proxy')
+                self.root.after(0, lambda: self._set_rotated_ui(user_id, display))
             else:
-                self._log(f'Profile {user_id} started with {display}')
-
-            self.root.after(0, lambda: self._update_profile_ui(user_id, display, '#44dd44'))
+                self._log(f'Failed: {msg}')
+                self.root.after(0, lambda: self._set_failed_ui(user_id))
 
         threading.Thread(target=do_rotate, daemon=True).start()
 
-    def _update_profile_ui(self, user_id, proxy_text, color):
+    def _restore_profile(self, user_id):
+        orig = self.original_proxies.get(user_id)
+        if not orig:
+            self._log(f'No original proxy saved for {user_id}')
+            return
+
         widgets = self.profile_widgets.get(user_id)
         if widgets:
-            widgets['proxy_lbl'].configure(text=proxy_text, fg=color)
+            widgets['restore_btn'].configure(state='disabled', text='...')
+            widgets['status_lbl'].configure(text='restoring...', fg='#FFD700')
+
+        def do_restore():
+            self._log(f'Restoring original proxy for {user_id}...')
+
+            ok, msg = self._update_proxy(user_id, orig)
+
+            if ok:
+                ph = orig.get('proxy_host', '')
+                pp = orig.get('proxy_port', '')
+                display = f'{ph}:{pp}' if ph else 'no proxy'
+                self._log(f'Restored to {display}')
+                self._log('Close & reopen the profile to apply')
+                self.root.after(0, lambda: self._set_restored_ui(user_id))
+            else:
+                self._log(f'Restore failed: {msg}')
+                self.root.after(0, lambda: self._set_failed_ui(user_id))
+
+        threading.Thread(target=do_restore, daemon=True).start()
+
+    def _set_rotated_ui(self, user_id, new_proxy):
+        widgets = self.profile_widgets.get(user_id)
+        if widgets:
+            if len(new_proxy) > 18:
+                new_proxy = new_proxy[:18] + '..'
+            widgets['status_lbl'].configure(text=f'-> {new_proxy}', fg='#FF9800')
             widgets['rotate_btn'].configure(state='normal', text='ROTATE')
+            widgets['restore_btn'].configure(state='normal')
+
+    def _set_restored_ui(self, user_id):
+        widgets = self.profile_widgets.get(user_id)
+        if widgets:
+            widgets['status_lbl'].configure(text='restored', fg='#44dd44')
+            widgets['rotate_btn'].configure(state='normal', text='ROTATE')
+            widgets['restore_btn'].configure(state='disabled')
+
+    def _set_failed_ui(self, user_id):
+        widgets = self.profile_widgets.get(user_id)
+        if widgets:
+            widgets['status_lbl'].configure(text='FAILED', fg='#ff4444')
+            widgets['rotate_btn'].configure(state='normal', text='ROTATE')
+            widgets['restore_btn'].configure(state='normal')
 
     def _on_close(self):
         self.root.destroy()
