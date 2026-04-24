@@ -1,7 +1,7 @@
 """
-ProxyRotator v4.0 - Instant Proxy Rotation for AdsPower
-Uses local proxy relay - no browser restart needed for rotation.
-First-time setup restarts once, after that rotations are instant.
+ProxyRotator v4.1 - Instant Proxy Rotation for AdsPower
+Uses local proxy relay - zero browser restart needed.
+Add profiles before opening them, then rotate instantly.
 
 Place proxies.txt next to this .exe (format: host:port:user:pass)
 """
@@ -25,7 +25,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "4.0"
+VERSION = "4.1"
 API_BASE = "http://127.0.0.1:50325"
 CONFIG_FILE = "proxyrotator.json"
 BASE_PORT = 10100
@@ -337,7 +337,7 @@ class ProxyRotatorApp:
         tf.pack(fill='x', padx=15, pady=(10, 5))
         tk.Label(tf, text='PROXY ROTATOR', font=('Segoe UI', 16, 'bold'),
                  fg='#e94560', bg='#1a1a2e').pack()
-        tk.Label(tf, text=f'v{VERSION} - Instant rotation (no browser restart)',
+        tk.Label(tf, text=f'v{VERSION} - Instant rotation, zero restart',
                  font=('Segoe UI', 8), fg='#8888aa', bg='#1a1a2e').pack()
 
         cf = tk.Frame(self.root, bg='#1a1a2e')
@@ -372,11 +372,11 @@ class ProxyRotatorApp:
                   cursor='hand2', command=self._add_profile)
         self.search_btn.pack(side='left', padx=4)
 
-        tk.Label(sf, text='serial # (restarts once)',
+        tk.Label(sf, text='serial # (no restart)',
                  font=('Segoe UI', 8), fg='#666', bg='#1a1a2e').pack(side='left', padx=4)
 
         info = tk.Label(self.root,
-            text='ROTATE = instant proxy change (no restart)  |  RESTORE = back to original + remove  |  X = remove',
+            text='ADD profiles before opening them  |  ROTATE = instant  |  RESTORE = original  |  X = remove',
             font=('Segoe UI', 8), fg='#FFD700', bg='#0f3460', pady=3)
         info.pack(fill='x', padx=15, pady=(5, 0))
 
@@ -493,9 +493,6 @@ class ProxyRotatorApp:
                     del self.relay_servers[uid]
                     continue
 
-                self._log(f'{sn}: set to relay port {port}. Restarting browser...')
-                restart_browser(uid)
-
                 self.dashboard[uid] = {
                     'serial': sn,
                     'user_id': uid,
@@ -507,7 +504,15 @@ class ProxyRotatorApp:
                     'rotated_config': None
                 }
                 self._save_dashboard()
-                self._log(f'{sn}: ready! Rotate will be instant now.')
+
+                active = api_get(f'/api/v1/browser/active?user_id={uid}')
+                is_running = (active.get('code') == 0 and
+                              active.get('data', {}).get('status') == 'Active')
+
+                if is_running:
+                    self._log(f'{sn}: relay ready on port {port}. Close & reopen profile to activate.')
+                else:
+                    self._log(f'{sn}: relay ready on port {port}. Open profile normally - rotation will be instant.')
 
             self.root.after(0, self._render_dashboard)
             self.root.after(0, lambda: self.search_btn.configure(state='normal', text='ADD'))
@@ -522,8 +527,8 @@ class ProxyRotatorApp:
 
         if not self.dashboard:
             tk.Label(self.profiles_frame,
-                text='No profiles added yet.\n\nType a serial number above and click ADD.\n'
-                     '(First add restarts the browser once, after that rotations are instant)',
+                text='No profiles added yet.\n\nAdd serial numbers BEFORE opening profiles.\n'
+                     'Then open normally in AdsPower - rotations will be instant.',
                 font=('Segoe UI', 10), fg='#888', bg='#16213e', pady=30).pack()
             return
 
