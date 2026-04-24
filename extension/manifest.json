@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Proxy Relay Controller",
+  "version": "1.0.0",
+  "description": "Control ProxyRelay - rotate proxies with one click",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8900/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
