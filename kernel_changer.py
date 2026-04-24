@@ -240,15 +240,23 @@ class KernelChangerApp:
                     sn = p.get('serial_number', '')
                     total += 1
 
-                    update_resp = api_post('/api/v1/user/update', {
-                        'user_id': uid,
-                        'fingerprint_config': {
-                            'browser_kernel_config': {
-                                'version': target,
-                                'type': 'chrome'
+                    update_resp = None
+                    for attempt in range(3):
+                        update_resp = api_post('/api/v1/user/update', {
+                            'user_id': uid,
+                            'fingerprint_config': {
+                                'browser_kernel_config': {
+                                    'version': target,
+                                    'type': 'chrome'
+                                }
                             }
-                        }
-                    })
+                        })
+                        if update_resp.get('code') == 0:
+                            break
+                        if 'Too many request' in update_resp.get('msg', ''):
+                            time.sleep(1.5)
+                        else:
+                            break
 
                     if update_resp.get('code') == 0:
                         success += 1
@@ -262,6 +270,8 @@ class KernelChangerApp:
                         self.root.after(0, lambda t=total, s=success, f=failed:
                             self.progress_label.configure(
                                 text=f'Progress: {t} done, {s} ok, {f} failed'))
+
+                    time.sleep(0.5)
 
                 page += 1
 
