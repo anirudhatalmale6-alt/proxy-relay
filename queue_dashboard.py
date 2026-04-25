@@ -22,10 +22,11 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.0"
+VERSION = "3.1"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
-SCAN_INTERVAL = 8
+SCAN_INTERVAL = 4
+FULL_SCAN_INTERVAL = 30
 
 _app_ref = None
 
@@ -334,10 +335,12 @@ class QueueDashboardApp:
         self.push_count = 0
         self.last_push_time = 0
         self.scanning = False
+        self.last_full_scan = 0
+        self.user_list_cache = {}
         self._build_ui()
         self._start_server()
         self._check_connection_loop()
-        self.root.after(2000, self._scan_loop)
+        self.root.after(1500, self._scan_loop)
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
@@ -527,35 +530,57 @@ class QueueDashboardApp:
 
     def _do_scan(self):
         try:
-            debug_ports = self._find_profile_ports()
-            if not debug_ports and not self.profiles:
-                self.root.after(0, lambda: self.status_label.configure(
-                    text=f'No profiles found | {time.strftime("%H:%M:%S")}'))
-                return
+            now = time.time()
+            need_full_scan = (now - self.last_full_scan) >= FULL_SCAN_INTERVAL or not self.profiles
 
-            current_ports = set()
-            for port in debug_ports:
-                current_ports.add(port)
-                key = str(port)
+            if need_full_scan:
+                self.last_full_scan = now
+                debug_ports = self._find_profile_ports()
+                if not debug_ports and not self.profiles:
+                    self.root.after(0, lambda: self.status_label.configure(
+                        text=f'No profiles found | {time.strftime("%H:%M:%S")}'))
+                    return
 
-                if key not in self.profiles:
-                    name, serial, uid = self._get_profile_info(port)
-                    self.profiles[key] = ProfileRow(port, name, serial, uid)
-                    ext_keys = set()
-                    if serial:
-                        ext_keys.add('s:' + serial)
-                    if uid:
-                        ext_keys.add('u:' + uid)
-                    self.profiles[key].ext_keys = ext_keys
-                    self.root.after(0, lambda p=port, n=name, s=serial: self._log(
-                        f'Found profile on port {p}: {s} ({n})'))
+                current_ports = set()
+                new_profiles = []
+                for port in debug_ports:
+                    current_ports.add(port)
+                    key = str(port)
+                    if key not in self.profiles:
+                        uid = self._get_uid_from_tabs(port)
+                        name = ''
+                        if uid:
+                            tabs = http_get_json(f'http://127.0.0.1:{port}/json')
+                            if tabs:
+                                for tab in tabs:
+                                    title = tab.get('title', '')
+                                    if '@' in title and '.' in title:
+                                        name = title.strip()
+                                        break
+                        self.profiles[key] = ProfileRow(port, name, '', uid)
+                        if uid:
+                            self.profiles[key].ext_keys.add('u:' + uid)
+                        new_profiles.append(key)
 
-                self._scan_profile_tabs(self.profiles[key])
-                time.sleep(0.3)
+                stale = [k for k in self.profiles if k not in [str(p) for p in current_ports]]
+                for k in stale:
+                    del self.profiles[k]
 
-            stale = [k for k in self.profiles if k not in [str(p) for p in current_ports]]
-            for k in stale:
-                del self.profiles[k]
+                if new_profiles:
+                    self._fetch_serials_bulk()
+                    for key in new_profiles:
+                        p = self.profiles.get(key)
+                        if p:
+                            self.root.after(0, lambda pp=p: self._log(
+                                f'Found profile port {pp.debug_port}: #{pp.serial} ({pp.name})'))
+
+                missing_serial = [p for p in self.profiles.values() if not p.serial]
+                if missing_serial:
+                    self._fetch_serials_bulk()
+
+            for key, profile in list(self.profiles.items()):
+                self._scan_profile_tabs(profile)
+                time.sleep(0.15)
 
             self.root.after(0, self._update_status_bar)
             self.root.after(0, self._render_table)
@@ -603,12 +628,8 @@ class QueueDashboardApp:
 
         return ports
 
-    def _get_profile_info(self, debug_port):
-        """Try to get profile name/serial from AdsPower API or from tab titles."""
-        name = ''
-        serial = ''
-        uid = ''
-
+    def _get_uid_from_tabs(self, debug_port):
+        """Extract AdsPower user_id from start.adspower.net tab URL."""
         tabs = http_get_json(f'http://127.0.0.1:{debug_port}/json')
         if tabs and isinstance(tabs, list):
             for tab in tabs:
@@ -616,27 +637,43 @@ class QueueDashboardApp:
                 if 'start.adspower.net' in url or 'start.adspower.com' in url:
                     m = re.search(r'[?&]id=([^&]+)', url)
                     if m:
-                        uid = m.group(1)
-                title = tab.get('title', '')
-                if '@' in title and '.' in title:
-                    name = title.strip()
+                        return m.group(1)
+        return ''
 
-        if uid:
-            try:
-                for base in [API_BASE, 'http://local.adspower.net:50325']:
-                    r = http_get_json(f'{base}/api/v1/user/list?user_id={uid}')
-                    if r and r.get('code') == 0:
-                        lst = r.get('data', {}).get('list', [])
-                        if lst:
-                            p = lst[0]
-                            serial = str(p.get('serial_number', p.get('serialnumber', '')))
-                            if not name:
-                                name = str(p.get('name', ''))
-                            break
-            except:
-                pass
+    def _fetch_serials_bulk(self):
+        """Fetch all profiles from AdsPower API in bulk and match by user_id."""
+        all_users = []
+        for base in [API_BASE, 'http://local.adspower.net:50325']:
+            page = 1
+            while page <= 50:
+                r = http_get_json(f'{base}/api/v1/user/list?page={page}&page_size=100')
+                if not r or r.get('code') != 0:
+                    break
+                items = r.get('data', {}).get('list', [])
+                if not items:
+                    break
+                all_users.extend(items)
+                page += 1
+                time.sleep(0.5)
+            if all_users:
+                break
 
-        return name, serial, uid
+        uid_map = {}
+        for u in all_users:
+            uid = str(u.get('user_id', ''))
+            serial = str(u.get('serial_number', u.get('serialnumber', '')))
+            name = str(u.get('name', ''))
+            if uid:
+                uid_map[uid] = {'serial': serial, 'name': name}
+
+        for key, profile in self.profiles.items():
+            if profile.uid and profile.uid in uid_map:
+                info = uid_map[profile.uid]
+                if info['serial'] and not profile.serial:
+                    profile.serial = info['serial']
+                    profile.ext_keys.add('s:' + info['serial'])
+                if info['name'] and not profile.name:
+                    profile.name = info['name']
 
     def _scan_profile_tabs(self, profile):
         """Scan a profile's tabs for TM queue pages."""
@@ -657,6 +694,13 @@ class QueueDashboardApp:
         if not page_tabs:
             profile.status = 'No tabs'
             return
+
+        if not profile.name:
+            for tab in page_tabs:
+                title = tab.get('title', '')
+                if '@' in title and '.' in title:
+                    profile.name = title.strip()
+                    break
 
         tm_tabs = [t for t in page_tabs if is_tm_url(t.get('url', ''))]
 
@@ -686,9 +730,14 @@ class QueueDashboardApp:
 
                 profile.status = 'Waiting'
         else:
-            tab = page_tabs[0]
-            profile.link = tab.get('url', '')
-            profile.event = clean_event_title(tab.get('title', ''), profile.link)
+            best = page_tabs[0]
+            for tab in page_tabs:
+                url = tab.get('url', '')
+                if 'start.adspower' not in url and 'chrome' not in url:
+                    best = tab
+                    break
+            profile.link = best.get('url', '')
+            profile.event = clean_event_title(best.get('title', ''), profile.link)
             profile.status = 'No TM page'
 
     def _update_status_bar(self):
