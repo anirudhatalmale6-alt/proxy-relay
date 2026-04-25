@@ -378,45 +378,64 @@ class QueueDashboardApp:
         event_map = data.get('profileEventMap', {})
         active_profiles = data.get('activeProfiles', [])
 
-        ext_profile_info = {}
+        if self.push_count <= 3 or self.push_count % 20 == 0:
+            self._log(f'Push #{self.push_count}: queue={len(queue_map)} link={len(link_map)} event={len(event_map)} active={len(active_profiles)}')
+            if queue_map:
+                self._log(f'  Queue keys: {list(queue_map.keys())[:5]}')
+            if link_map:
+                self._log(f'  Link keys: {list(link_map.keys())[:5]}')
+            if event_map:
+                self._log(f'  Event keys: {list(event_map.keys())[:5]}')
+            if active_profiles:
+                for ap in active_profiles[:3]:
+                    self._log(f'  Active: serial={ap.get("serialNumber","")} uid={ap.get("userId","")} name={ap.get("name","")}')
+
         for p in active_profiles:
             serial = str(p.get('serialNumber', p.get('serial_number', p.get('serialnumber', ''))))
             uid = str(p.get('userId', p.get('user_id', '')))
             name = str(p.get('name', ''))
             custom = str(p.get('customUserId', p.get('custom_user_id', '')))
-            if serial or uid:
-                ext_profile_info[serial or uid] = {
-                    'serial': serial, 'name': name, 'uid': uid, 'custom': custom
-                }
+
+            key = serial or uid
+            if not key:
+                continue
+
+            ext_keys = set()
+            if serial:
+                ext_keys.add('s:' + serial)
+            if custom and custom != serial:
+                ext_keys.add('s:' + custom)
+            if uid:
+                ext_keys.add('u:' + uid)
+
+            if key not in self.profiles:
+                self.profiles[key] = ProfileRow(serial, name, uid)
+                self.profiles[key].ext_keys = ext_keys
+                self._log(f'Added profile from extension: {serial} ({name}) uid={uid}')
+            else:
+                if name:
+                    self.profiles[key].name = name
+                self.profiles[key].ext_keys.update(ext_keys)
 
         all_ext_keys = set()
         for k in list(queue_map.keys()) + list(link_map.keys()) + list(event_map.keys()):
             all_ext_keys.add(k)
 
-        if not self.profiles and all_ext_keys:
-            self._log(f'Extension has {len(all_ext_keys)} profile keys, creating from extension data')
-            grouped = {}
-            for ek in all_ext_keys:
-                raw = strip_prefix(ek)
-                if raw not in grouped:
-                    grouped[raw] = {'serial': '', 'uid': '', 'ext_keys': set()}
-                if ek.startswith('s:'):
-                    grouped[raw]['serial'] = raw
-                elif ek.startswith('u:'):
-                    grouped[raw]['uid'] = raw
-                grouped[raw]['ext_keys'].add(ek)
-
-            for raw, info in grouped.items():
-                key = info['serial'] or info['uid'] or raw
+        for ek in all_ext_keys:
+            raw = strip_prefix(ek)
+            already_tracked = False
+            for p in self.profiles.values():
+                if ek in p.ext_keys or raw == p.serial or raw == p.uid:
+                    already_tracked = True
+                    break
+            if not already_tracked:
+                serial = raw if ek.startswith('s:') else ''
+                uid = raw if ek.startswith('u:') else ''
+                key = serial or uid or raw
                 if key not in self.profiles:
-                    ep = ext_profile_info.get(key, {})
-                    name = ep.get('name', '')
-                    self.profiles[key] = ProfileRow(
-                        info['serial'] or ep.get('serial', ''),
-                        name,
-                        info['uid'] or ep.get('uid', key)
-                    )
-                    self.profiles[key].ext_keys = info['ext_keys']
+                    self.profiles[key] = ProfileRow(serial, '', uid)
+                    self.profiles[key].ext_keys = {ek}
+                    self._log(f'Added profile from map key: {ek}')
 
         for key, profile in self.profiles.items():
             lookup_keys = set(profile.ext_keys)
@@ -448,10 +467,6 @@ class QueueDashboardApp:
                 if evt:
                     profile.event = clean_event_title(str(evt), profile.link)
                     break
-
-            ep = ext_profile_info.get(profile.serial) or ext_profile_info.get(profile.uid)
-            if ep and ep.get('name') and not profile.name:
-                profile.name = ep['name']
 
         self._update_status_bar()
         self._render_table()
@@ -516,36 +531,21 @@ class QueueDashboardApp:
             self.polling = False
 
     def _get_running_profiles(self):
-        resp = api_get('/api/v1/browser/active?page=1&page_size=100')
-        if resp.get('code') == 0:
-            data = resp.get('data', {})
-            if isinstance(data, list):
-                lst = data
-            elif isinstance(data, dict):
-                lst = data.get('list', [])
-            else:
-                lst = []
-
-            if lst:
-                has_serial = any(p.get('serial_number') or p.get('serialnumber') for p in lst)
-                if not has_serial:
-                    lst = self._enrich_with_user_list(lst)
-                return lst
-
+        for base in [API_BASE, 'http://local.adspower.net:50325']:
+            try:
+                url = base + '/api/v1/browser/active?page=1&page_size=100'
+                req = urllib.request.Request(url, method='GET')
+                req.add_header('Content-Type', 'application/json')
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode())
+                if data.get('code') == 0:
+                    d = data.get('data', {})
+                    lst = d.get('list', []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
+                    if lst:
+                        return lst
+            except:
+                continue
         return []
-
-    def _enrich_with_user_list(self, active_list):
-        active_ids = {str(p.get('user_id', '')): p for p in active_list if p.get('user_id')}
-        r = api_get('/api/v1/user/list?page=1&page_size=100')
-        if r.get('code') != 0:
-            return active_list
-        all_users = r.get('data', {}).get('list', [])
-        enriched = []
-        for u in all_users:
-            uid = str(u.get('user_id', ''))
-            if uid in active_ids:
-                enriched.append(u)
-        return enriched if enriched else active_list
 
     def _update_status_bar(self):
         active_in_queue = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
