@@ -1,7 +1,8 @@
 """
-AdsPower Queue Dashboard v2.1
+AdsPower Queue Dashboard v2.2
 Hybrid approach: polls AdsPower API for running profiles, receives queue
 data from the Dashboard Chrome extension via HTTP POST on port 12345.
+Extension uses prefixed keys: s:SERIAL, u:USER_ID in its maps.
 """
 
 import tkinter as tk
@@ -20,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "2.1"
+VERSION = "2.2"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 POLL_INTERVAL = 8
@@ -167,6 +168,13 @@ def event_from_url(url):
     return ''
 
 
+def strip_prefix(key):
+    """Extension keys are prefixed: s:SERIAL or u:USER_ID"""
+    if key and len(key) > 2 and key[1] == ':':
+        return key[2:]
+    return key
+
+
 class PushHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -217,6 +225,7 @@ class ProfileRow:
         self.link = ''
         self.status = 'Waiting'
         self.last_update = 0
+        self.ext_keys = set()
 
 
 class QueueDashboardApp:
@@ -227,12 +236,10 @@ class QueueDashboardApp:
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
         self.profiles = {}
-        self.queue_data = {}
-        self.link_data = {}
-        self.event_data = {}
         self.push_count = 0
         self.last_push_time = 0
         self.polling = False
+        self.api_works = None
         self._build_ui()
         self._start_server()
         self._check_connection_loop()
@@ -338,7 +345,7 @@ class QueueDashboardApp:
                                  height=4, border=0, wrap='word', state='disabled')
         self.log_text.pack(fill='x')
 
-        self._log(f'Listening on port {LISTEN_PORT} for extension data. Polling AdsPower for profiles...')
+        self._log(f'Listening on port {LISTEN_PORT}. Polling AdsPower for profiles...')
 
     def _start_server(self):
         global _app_ref
@@ -369,39 +376,82 @@ class QueueDashboardApp:
         queue_map = data.get('profileQueueMap', {})
         link_map = data.get('profileLinkMap', {})
         event_map = data.get('profileEventMap', {})
+        active_profiles = data.get('activeProfiles', [])
 
-        self.queue_data.update(queue_map)
-        self.link_data.update(link_map)
-        self.event_data.update(event_map)
+        ext_profile_info = {}
+        for p in active_profiles:
+            serial = str(p.get('serialNumber', p.get('serial_number', p.get('serialnumber', ''))))
+            uid = str(p.get('userId', p.get('user_id', '')))
+            name = str(p.get('name', ''))
+            custom = str(p.get('customUserId', p.get('custom_user_id', '')))
+            if serial or uid:
+                ext_profile_info[serial or uid] = {
+                    'serial': serial, 'name': name, 'uid': uid, 'custom': custom
+                }
 
-        self._apply_extension_data()
+        all_ext_keys = set()
+        for k in list(queue_map.keys()) + list(link_map.keys()) + list(event_map.keys()):
+            all_ext_keys.add(k)
 
-    def _apply_extension_data(self):
-        matched = 0
+        if not self.profiles and all_ext_keys:
+            self._log(f'Extension has {len(all_ext_keys)} profile keys, creating from extension data')
+            grouped = {}
+            for ek in all_ext_keys:
+                raw = strip_prefix(ek)
+                if raw not in grouped:
+                    grouped[raw] = {'serial': '', 'uid': '', 'ext_keys': set()}
+                if ek.startswith('s:'):
+                    grouped[raw]['serial'] = raw
+                elif ek.startswith('u:'):
+                    grouped[raw]['uid'] = raw
+                grouped[raw]['ext_keys'].add(ek)
+
+            for raw, info in grouped.items():
+                key = info['serial'] or info['uid'] or raw
+                if key not in self.profiles:
+                    ep = ext_profile_info.get(key, {})
+                    name = ep.get('name', '')
+                    self.profiles[key] = ProfileRow(
+                        info['serial'] or ep.get('serial', ''),
+                        name,
+                        info['uid'] or ep.get('uid', key)
+                    )
+                    self.profiles[key].ext_keys = info['ext_keys']
+
         for key, profile in self.profiles.items():
-            lookup_keys = [key, profile.serial, profile.uid, profile.name]
-            lookup_keys = [k for k in lookup_keys if k]
+            lookup_keys = set(profile.ext_keys)
+            if profile.serial:
+                lookup_keys.add('s:' + profile.serial)
+            if profile.uid:
+                lookup_keys.add('u:' + profile.uid)
+            lookup_keys.add(key)
+            lookup_keys.add(profile.serial)
+            lookup_keys.add(profile.uid)
+            lookup_keys.discard('')
 
             for lk in lookup_keys:
-                q = self.queue_data.get(lk)
+                q = queue_map.get(lk)
                 if q is not None and isinstance(q, (int, float)) and q > 0:
                     profile.queue_num = int(q)
                     profile.status = 'In Queue'
                     profile.last_update = time.time()
-                    matched += 1
                     break
 
             for lk in lookup_keys:
-                link = self.link_data.get(lk)
+                link = link_map.get(lk)
                 if link:
                     profile.link = str(link)
                     break
 
             for lk in lookup_keys:
-                evt = self.event_data.get(lk)
+                evt = event_map.get(lk)
                 if evt:
                     profile.event = clean_event_title(str(evt), profile.link)
                     break
+
+            ep = ext_profile_info.get(profile.serial) or ext_profile_info.get(profile.uid)
+            if ep and ep.get('name') and not profile.name:
+                profile.name = ep['name']
 
         self._update_status_bar()
         self._render_table()
@@ -416,36 +466,49 @@ class QueueDashboardApp:
         try:
             profiles_found = self._get_running_profiles()
             if not profiles_found:
-                self.root.after(0, lambda: self._update_status_bar())
+                if self.api_works is None:
+                    self.api_works = False
+                    self.root.after(0, lambda: self._log('AdsPower API unavailable, using extension data only'))
                 self.polling = False
                 return
+
+            if not self.api_works:
+                self.api_works = True
+                self.root.after(0, lambda: self._log(f'AdsPower API connected, found {len(profiles_found)} running'))
 
             current_keys = set()
             for pdata in profiles_found:
                 serial = str(pdata.get('serial_number', pdata.get('serialnumber', '')))
                 uid = str(pdata.get('user_id', ''))
                 name = str(pdata.get('name', pdata.get('profile_name', '')))
-                custom = str(pdata.get('custom_user_id', ''))
 
                 key = serial or uid
                 if not key:
                     continue
                 current_keys.add(key)
 
+                ext_keys = set()
+                if serial:
+                    ext_keys.add('s:' + serial)
+                if uid:
+                    ext_keys.add('u:' + uid)
+
                 if key not in self.profiles:
                     self.profiles[key] = ProfileRow(serial, name, uid)
-                    self.root.after(0, lambda s=serial, n=name: self._log(f'Found profile: {s} ({n})'))
+                    self.profiles[key].ext_keys = ext_keys
                 else:
                     if name:
                         self.profiles[key].name = name
                     if serial:
                         self.profiles[key].serial = serial
+                    self.profiles[key].ext_keys.update(ext_keys)
 
             stale = [k for k in self.profiles if k not in current_keys]
             for k in stale:
                 del self.profiles[k]
 
-            self.root.after(0, self._apply_extension_data)
+            self.root.after(0, self._update_status_bar)
+            self.root.after(0, self._render_table)
 
         except Exception as e:
             self.root.after(0, lambda: self._log(f'Poll error: {e}'))
@@ -469,32 +532,7 @@ class QueueDashboardApp:
                     lst = self._enrich_with_user_list(lst)
                 return lst
 
-        page = 1
-        all_profiles = []
-        while True:
-            r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
-            if r.get('code') != 0:
-                break
-            items = r.get('data', {}).get('list', [])
-            if not items:
-                break
-            all_profiles.extend(items)
-            page += 1
-            time.sleep(0.5)
-
-        running = []
-        for p in all_profiles:
-            uid = p.get('user_id', '')
-            if not uid:
-                continue
-            check = api_get(f'/api/v1/browser/active?user_id={uid}')
-            if check.get('code') == 0:
-                data_c = check.get('data', {})
-                if isinstance(data_c, dict) and data_c.get('status') == 'Active':
-                    running.append(p)
-            time.sleep(0.3)
-
-        return running
+        return []
 
     def _enrich_with_user_list(self, active_list):
         active_ids = {str(p.get('user_id', '')): p for p in active_list if p.get('user_id')}
@@ -511,9 +549,10 @@ class QueueDashboardApp:
 
     def _update_status_bar(self):
         active_in_queue = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
-        ext = f' | Ext push #{self.push_count}' if self.push_count > 0 else ''
+        src = 'API+Ext' if self.api_works else 'Ext only'
+        ext = f' | Push #{self.push_count}' if self.push_count > 0 else ''
         self.status_label.configure(
-            text=f'{len(self.profiles)} profiles | {active_in_queue} in queue{ext} | {time.strftime("%H:%M:%S")}')
+            text=f'{len(self.profiles)} profiles | {active_in_queue} in queue | {src}{ext} | {time.strftime("%H:%M:%S")}')
 
     def _render_table(self):
         for widget in self.table_inner.winfo_children():
@@ -563,28 +602,26 @@ class QueueDashboardApp:
     def _refresh_all(self):
         def do_refresh():
             self._log('Refreshing all profile tabs...')
-            resp = api_get('/api/v1/browser/active?page=1&page_size=100')
-            if resp.get('code') != 0:
-                self.root.after(0, lambda: self._log('Could not get active profiles'))
-                return
-
-            data = resp.get('data', {})
-            profiles = data.get('list', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             count = 0
-
-            for p in profiles:
+            for key, profile in list(self.profiles.items()):
+                uid = profile.uid
+                if not uid:
+                    continue
+                check = api_get(f'/api/v1/browser/active?user_id={uid}')
+                data = check.get('data', {})
                 debug_port = 0
-                dp = p.get('debug_port')
-                if dp:
-                    debug_port = int(str(dp))
-                if not debug_port:
-                    ws = p.get('ws', {})
-                    if isinstance(ws, dict):
-                        ws_url = ws.get('puppeteer', ws.get('selenium', ''))
-                        if ws_url:
-                            m = re.search(r':(\d+)/', ws_url)
-                            if m:
-                                debug_port = int(m.group(1))
+                if isinstance(data, dict):
+                    dp = data.get('debug_port')
+                    if dp:
+                        debug_port = int(str(dp))
+                    if not debug_port:
+                        ws = data.get('ws', {})
+                        if isinstance(ws, dict):
+                            ws_url = ws.get('puppeteer', ws.get('selenium', ''))
+                            if ws_url:
+                                m = re.search(r':(\d+)/', ws_url)
+                                if m:
+                                    debug_port = int(m.group(1))
                 if not debug_port:
                     continue
 
@@ -598,14 +635,12 @@ class QueueDashboardApp:
                     cdp_evaluate(ws_url, 'location.reload()')
                     count += 1
                     time.sleep(0.2)
+                time.sleep(0.3)
 
             self.root.after(0, lambda c=count: self._log(f'Refreshed {c} tabs'))
         threading.Thread(target=do_refresh, daemon=True).start()
 
     def _clear_data(self):
-        self.queue_data.clear()
-        self.link_data.clear()
-        self.event_data.clear()
         for p in self.profiles.values():
             p.queue_num = 0
             p.event = ''
