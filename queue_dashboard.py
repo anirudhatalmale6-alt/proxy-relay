@@ -1,8 +1,7 @@
 """
-AdsPower Queue Dashboard v3.0
-Fully self-sufficient: scans for Chrome debug ports directly, evaluates
-queue JS via CDP. Also listens on port 12345 for extension push data
-as a bonus. No dependency on AdsPower API or extension being active.
+AdsPower Queue Dashboard v3.1
+Scans for Chrome debug ports, evaluates queue JS via CDP.
+Discord screenshot, fast 4s scans, bulk serial fetch.
 """
 
 import tkinter as tk
@@ -838,6 +837,97 @@ class QueueDashboardApp:
                 self.root.after(0, lambda m=resp.get('msg', ''): self._log(f'Close failed: {m}'))
         threading.Thread(target=do_close, daemon=True).start()
 
+    def _capture_screenshot(self):
+        """Capture the dashboard window as BMP bytes using Win32 API."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+
+            hwnd = int(self.root.frame(), 16) if hasattr(self.root, 'frame') else user32.GetForegroundWindow()
+
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+
+            if w <= 0 or h <= 0:
+                return None
+
+            hdc_screen = user32.GetDC(0)
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+            gdi32.SelectObject(hdc_mem, hbmp)
+
+            result = user32.PrintWindow(hwnd, hdc_mem, 2)
+            if not result:
+                gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, rect.left, rect.top, 0x00CC0020)
+
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ('biSize', wintypes.DWORD), ('biWidth', ctypes.c_long),
+                    ('biHeight', ctypes.c_long), ('biPlanes', wintypes.WORD),
+                    ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD),
+                    ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', ctypes.c_long),
+                    ('biYPelsPerMeter', ctypes.c_long), ('biClrUsed', wintypes.DWORD),
+                    ('biClrImportant', wintypes.DWORD),
+                ]
+
+            bi = BITMAPINFOHEADER()
+            bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bi.biWidth = w
+            bi.biHeight = -h
+            bi.biPlanes = 1
+            bi.biBitCount = 24
+            bi.biCompression = 0
+
+            row_size = ((w * 3 + 3) // 4) * 4
+            img_size = row_size * h
+            buf = ctypes.create_string_buffer(img_size)
+
+            gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
+
+            import struct, io, zlib
+            raw_rows = []
+            for y in range(h):
+                row_data = bytearray(w * 3)
+                for x in range(w):
+                    offset = y * row_size + x * 3
+                    b, g, r = buf[offset], buf[offset + 1], buf[offset + 2]
+                    row_data[x * 3] = ord(r) if isinstance(r, str) else r
+                    row_data[x * 3 + 1] = ord(g) if isinstance(g, str) else g
+                    row_data[x * 3 + 2] = ord(b) if isinstance(b, str) else b
+                raw_rows.append(b'\x00' + bytes(row_data))
+
+            raw = b''.join(raw_rows)
+            compressed = zlib.compress(raw)
+
+            png = io.BytesIO()
+            png.write(b'\x89PNG\r\n\x1a\n')
+
+            def write_chunk(chunk_type, data):
+                png.write(struct.pack('>I', len(data)))
+                png.write(chunk_type)
+                png.write(data)
+                crc = zlib.crc32(chunk_type + data) & 0xffffffff
+                png.write(struct.pack('>I', crc))
+
+            ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+            write_chunk(b'IHDR', ihdr)
+            write_chunk(b'IDAT', compressed)
+            write_chunk(b'IEND', b'')
+
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(0, hdc_screen)
+
+            return png.getvalue()
+        except Exception as e:
+            self._log(f'Screenshot failed: {e}')
+            return None
+
     def _send_discord(self):
         name = self.discord_name_entry.get().strip()
         webhook = self.discord_hook_entry.get().strip()
@@ -848,29 +938,61 @@ class QueueDashboardApp:
             self._log('Enter a valid Discord webhook URL')
             return
 
+        screenshot_data = self._capture_screenshot()
+
         def do_send():
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            lines = [f'**Queue Dashboard** | {name} | {ts}\n']
-            lines.append('```')
-            lines.append(f'{"Serial":<10} {"Name":<20} {"Queue #":<10} {"Event":<30}')
-            lines.append('-' * 72)
 
             sorted_p = sorted(self.profiles.values(),
                                key=lambda p: (-(p.queue_num or 999999), p.serial or ''))
-            for p in sorted_p:
-                q = str(p.queue_num) if p.queue_num and p.queue_num > 0 else '--'
-                lines.append(f'{(p.serial or "--"):<10} {(p.name or "--")[:20]:<20} {q:<10} {(p.event or "--")[:30]:<30}')
-            lines.append('```')
+
+            lines = [f'**Queue Dashboard** | {name} | {ts}']
+            in_queue = sum(1 for p in sorted_p if p.queue_num and p.queue_num > 0)
+            lines.append(f'{len(sorted_p)} profiles | {in_queue} in queue')
+
+            if in_queue > 0:
+                lines.append('```')
+                lines.append(f'{"#":<7} {"Name":<22} {"Queue":<8} {"Event":<30}')
+                lines.append('-' * 68)
+                for p in sorted_p:
+                    if p.queue_num and p.queue_num > 0:
+                        lines.append(f'{(p.serial or "--"):<7} {(p.name or "--")[:22]:<22} {str(p.queue_num):<8} {(p.event or "--")[:30]:<30}')
+                lines.append('```')
 
             content = '\n'.join(lines)
-            payload = json.dumps({'username': f'{name} | Queue Dashboard', 'content': content})
 
             try:
-                req = urllib.request.Request(webhook, data=payload.encode('utf-8'), method='POST')
-                req.add_header('Content-Type', 'application/json')
-                with urllib.request.urlopen(req, timeout=10) as resp:
+                if screenshot_data:
+                    import io
+                    boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+                    body = io.BytesIO()
+
+                    body.write(f'--{boundary}\r\n'.encode())
+                    body.write(f'Content-Disposition: form-data; name="payload_json"\r\n'.encode())
+                    body.write(b'Content-Type: application/json\r\n\r\n')
+                    payload = json.dumps({'username': f'{name} | Queue Dashboard', 'content': content})
+                    body.write(payload.encode())
+                    body.write(b'\r\n')
+
+                    body.write(f'--{boundary}\r\n'.encode())
+                    body.write(f'Content-Disposition: form-data; name="file"; filename="queue_dashboard.png"\r\n'.encode())
+                    body.write(b'Content-Type: image/png\r\n\r\n')
+                    body.write(screenshot_data)
+                    body.write(b'\r\n')
+                    body.write(f'--{boundary}--\r\n'.encode())
+
+                    data = body.getvalue()
+                    req = urllib.request.Request(webhook, data=data, method='POST')
+                    req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+                else:
+                    data = json.dumps({'username': f'{name} | Queue Dashboard', 'content': content}).encode()
+                    req = urllib.request.Request(webhook, data=data, method='POST')
+                    req.add_header('Content-Type', 'application/json')
+
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     if resp.status < 300:
-                        self.root.after(0, lambda: self._log('Discord message sent!'))
+                        msg = 'Discord sent with screenshot!' if screenshot_data else 'Discord sent (text only)'
+                        self.root.after(0, lambda: self._log(msg))
                     else:
                         self.root.after(0, lambda: self._log(f'Discord error: {resp.status}'))
             except Exception as e:
