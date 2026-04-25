@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.1"
+VERSION = "3.2"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -296,7 +296,7 @@ class PushHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
@@ -305,7 +305,23 @@ class PushHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(b'{"status":"running","app":"QueueDashboard"}')
+
+        if self.path == '/queues' and _app_ref:
+            result = {}
+            for key, p in _app_ref.profiles.items():
+                entry = {
+                    'serial': p.serial or '',
+                    'uid': p.uid or '',
+                    'name': p.name or '',
+                    'queue': p.queue_num,
+                    'event': p.event or '',
+                    'link': p.link or '',
+                    'status': p.status or ''
+                }
+                result[key] = entry
+            self.wfile.write(json.dumps({'profiles': result}).encode('utf-8'))
+        else:
+            self.wfile.write(b'{"status":"running","app":"QueueDashboard"}')
 
 
 class ProfileRow:
