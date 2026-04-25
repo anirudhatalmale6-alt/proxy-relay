@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.2"
+VERSION = "3.3"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -593,9 +593,18 @@ class QueueDashboardApp:
                 if missing_serial:
                     self._fetch_serials_bulk()
 
+            dead_keys = []
             for key, profile in list(self.profiles.items()):
-                self._scan_profile_tabs(profile)
+                alive = self._scan_profile_tabs(profile)
+                if alive is False:
+                    dead_keys.append(key)
                 time.sleep(0.15)
+
+            for k in dead_keys:
+                p = self.profiles.pop(k, None)
+                if p:
+                    self.root.after(0, lambda pp=p: self._log(
+                        f'Profile closed: port {pp.debug_port} #{pp.serial}'))
 
             self.root.after(0, self._update_status_bar)
             self.root.after(0, self._render_table)
@@ -691,15 +700,22 @@ class QueueDashboardApp:
                     profile.name = info['name']
 
     def _scan_profile_tabs(self, profile):
-        """Scan a profile's tabs for TM queue pages."""
+        """Scan a profile's tabs for TM queue pages. Returns False if port is dead."""
         port = profile.debug_port
         if not port:
-            return
+            return False
 
         tabs = http_get_json(f'http://127.0.0.1:{port}/json')
         if not tabs or not isinstance(tabs, list):
-            profile.status = 'No tabs'
-            return
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(('127.0.0.1', port))
+                s.close()
+                profile.status = 'No tabs'
+                return True
+            except:
+                return False
 
         page_tabs = [t for t in tabs if t.get('webSocketDebuggerUrl') and
                      t.get('type', 'page') == 'page' and
@@ -708,7 +724,7 @@ class QueueDashboardApp:
 
         if not page_tabs:
             profile.status = 'No tabs'
-            return
+            return True
 
         if not profile.name:
             for tab in page_tabs:
@@ -739,7 +755,7 @@ class QueueDashboardApp:
                             profile.event = clean_event_title(data.get('t', ''), profile.link)
                             profile.status = 'In Queue'
                             profile.last_update = time.time()
-                            return
+                            return True
                     except:
                         pass
 
@@ -754,6 +770,7 @@ class QueueDashboardApp:
             profile.link = best.get('url', '')
             profile.event = clean_event_title(best.get('title', ''), profile.link)
             profile.status = 'No TM page'
+        return True
 
     def _update_status_bar(self):
         active_in_queue = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
