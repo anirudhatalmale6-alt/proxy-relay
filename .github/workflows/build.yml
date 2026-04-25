@@ -25,6 +25,9 @@ jobs:
       - name: Build KernelChanger EXE
         run: pyinstaller --onefile --windowed --name KernelChanger kernel_changer.py
 
+      - name: Build QueueDashboard EXE
+        run: pyinstaller --onefile --windowed --name QueueDashboard queue_dashboard.py
+
       - name: Upload ProxyRelay
         uses: actions/upload-artifact@v4
         with:
@@ -36,3 +39,9 @@ jobs:
         with:
           name: KernelChanger-Windows
           path: dist/KernelChanger.exe
+
+      - name: Upload QueueDashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: QueueDashboard-Windows
+          path: dist/QueueDashboard.exe
