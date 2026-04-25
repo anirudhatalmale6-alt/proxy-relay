@@ -1,7 +1,7 @@
 """
-AdsPower Queue Dashboard
-Monitors Ticketmaster queue positions across all running AdsPower profiles.
-Dark theme, APM-style standalone app.
+AdsPower Queue Dashboard v2.0
+Receives live queue data from the AdsPower Dashboard Chrome extension
+via HTTP POST on port 12345. Dark theme, APM-style standalone app.
 """
 
 import tkinter as tk
@@ -18,60 +18,13 @@ try:
 except ImportError:
     pass
 
-VERSION = "1.0"
-API_BASE = "http://127.0.0.1:50325"
-SCAN_INTERVAL = 6
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-QUEUE_JS = r"""(function() {
-    function parseNum(str) {
-        var n = parseInt(String(str || '').replace(/,/g, ''), 10);
-        return (n > 0 && n < 100000000) ? n : null;
-    }
-    var selectors = [
-        '#MainPart_lbQueueNumber', '#lbQueueNumber', '[id*="lbQueueNumber"]',
-        '#MainPart_h2HeaderSubText', '#h2-main', '.queue-position',
-        '[class*="queue-position"]', '[class*="queuePosition"]',
-        '[id*="queue-position"]', '[id*="queuePosition"]',
-        '[class*="queueNumber"]', '[id*="queueNumber"]',
-        '[class*="waiting-number"]', '[id*="waiting-number"]',
-        '[class*="place-in-line"]', '[class*="placeInLine"]',
-        '[class*="spot-number"]', '[data-queue-number]',
-        '.number-display', '#queue-number'
-    ];
-    var patterns = [
-        /you\s+are\s+(?:now\s+)?in\s+the\s+queue\s*#?\s*([\d,]{1,8})/i,
-        /\bin\s+the\s+queue\s*#\s*([\d,]{1,8})/i,
-        /([\d,]{1,8})\s+people\s+ahead\s+of\s+you/i,
-        /([\d,]{1,8})\s+people?\s+ahead/i,
-        /([\d,]{1,8})\s+waiting\s+ahead/i,
-        /you\s+are\s+(?:now\s+)?(?:number\s+|#\s*)?([\d,]{1,8})\s+in/i,
-        /(?:your\s+)?(?:queue\s+)?position\s+(?:is\s+)?(?:number\s+|#\s*)?([\d,]{1,8})/i,
-        /you(?:'re| are)(?: currently)?\s+(?:number|#|position)\s*([\d,]{1,8})/i,
-        /\bplace\s+#?([\d,]{1,8})/i,
-        /#([\d,]{1,8})\s+in\s+(?:line|queue)/i,
-        /there\s+are\s+([\d,]{1,8})\s+people/i
-    ];
-    function fromText(text) {
-        text = String(text || '');
-        for (var i = 0; i < patterns.length; i++) {
-            var m = text.match(patterns[i]);
-            if (m) { var n = parseNum(m[1]); if (n !== null) return n; }
-        }
-        return null;
-    }
-    for (var s = 0; s < selectors.length; s++) {
-        try {
-            var el = document.querySelector(selectors[s]);
-            if (!el) continue;
-            var cleaned = String(el.textContent || '').replace(/,/g, '').match(/\d+/);
-            if (cleaned) { var n1 = parseNum(cleaned[0]); if (n1 !== null) return JSON.stringify({q: n1, u: location.href, t: document.title}); }
-        } catch(e) {}
-    }
-    var text = document.body ? document.body.innerText : '';
-    var textNum = fromText(text);
-    if (textNum !== null) return JSON.stringify({q: textNum, u: location.href, t: document.title});
-    return JSON.stringify({q: 0, u: location.href, t: document.title});
-})()"""
+VERSION = "2.0"
+API_BASE = "http://127.0.0.1:50325"
+LISTEN_PORT = 12345
+
+_app_ref = None
 
 
 def api_get(path):
@@ -213,20 +166,55 @@ def event_from_url(url):
     return ''
 
 
-def is_tm_url(url):
-    return bool(re.search(r'ticketmaster|livenation|queue-it|queue', url, re.IGNORECASE))
+class PushHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        if self.path != '/push':
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length) if length else b''
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+        if _app_ref and body:
+            try:
+                data = json.loads(body.decode('utf-8'))
+                _app_ref.root.after(0, lambda d=data: _app_ref._handle_push(d))
+            except:
+                pass
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(b'{"status":"running","app":"QueueDashboard"}')
 
 
 class ProfileRow:
-    def __init__(self, serial, name, uid, debug_port):
+    def __init__(self, serial, name, uid):
         self.serial = serial
         self.name = name
         self.uid = uid
-        self.debug_port = debug_port
         self.queue_num = 0
         self.event = ''
         self.link = ''
-        self.status = 'Scanning...'
+        self.status = 'Waiting'
         self.last_update = 0
 
 
@@ -238,11 +226,11 @@ class QueueDashboardApp:
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
         self.profiles = {}
-        self.scanning = False
-        self.discord_webhook = ''
-        self.discord_name = ''
+        self.push_count = 0
+        self.last_push_time = 0
         self._build_ui()
-        self.root.after(1000, self._scan_loop)
+        self._start_server()
+        self._check_connection_loop()
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
@@ -266,9 +254,13 @@ class QueueDashboardApp:
         tk.Label(top, text=f'v{VERSION}',
                  font=('Segoe UI', 9), fg='#555', bg='#1a1a2e').pack(side='left', padx=8)
 
-        self.status_label = tk.Label(top, text='Starting...',
+        self.status_label = tk.Label(top, text='Waiting for extension...',
                                       font=('Segoe UI', 9), fg='#888', bg='#1a1a2e')
         self.status_label.pack(side='right')
+
+        self.conn_indicator = tk.Label(top, text='●', font=('Segoe UI', 12),
+                                        fg='#ff4444', bg='#1a1a2e')
+        self.conn_indicator.pack(side='right', padx=(0, 8))
 
         btn_frame = tk.Frame(self.root, bg='#1a1a2e')
         btn_frame.pack(fill='x', padx=10, pady=3)
@@ -306,7 +298,6 @@ class QueueDashboardApp:
                   fg='#fff', bg='#5865F2', border=0, padx=8, pady=2,
                   cursor='hand2', command=self._send_discord).pack(side='left', padx=2)
 
-        # Table header
         header_frame = tk.Frame(self.root, bg='#16213e')
         header_frame.pack(fill='x', padx=10, pady=(8, 0))
 
@@ -316,7 +307,6 @@ class QueueDashboardApp:
             tk.Label(header_frame, text=text, font=('Segoe UI', 9, 'bold'),
                      fg='#FFD700', bg='#16213e', width=w // 7, anchor='w').pack(side='left', padx=1)
 
-        # Scrollable table
         table_container = tk.Frame(self.root, bg='#1a1a2e')
         table_container.pack(fill='both', expand=True, padx=10, pady=2)
 
@@ -335,7 +325,6 @@ class QueueDashboardApp:
         self.table_canvas.bind_all('<MouseWheel>',
                                     lambda e: self.table_canvas.yview_scroll(-1 * (e.delta // 120), 'units'))
 
-        # Log
         log_frame = tk.Frame(self.root, bg='#1a1a2e')
         log_frame.pack(fill='x', padx=10, pady=(3, 10))
         tk.Label(log_frame, text='Log', font=('Segoe UI', 8), fg='#888', bg='#1a1a2e').pack(anchor='w')
@@ -343,7 +332,98 @@ class QueueDashboardApp:
                                  height=4, border=0, wrap='word', state='disabled')
         self.log_text.pack(fill='x')
 
-        self._log('Queue Dashboard started. Scanning for profiles...')
+        self._log(f'Listening on port {LISTEN_PORT} for dashboard extension data...')
+
+    def _start_server(self):
+        global _app_ref
+        _app_ref = self
+
+        def run_server():
+            try:
+                server = HTTPServer(('127.0.0.1', LISTEN_PORT), PushHandler)
+                server.serve_forever()
+            except OSError as e:
+                self.root.after(0, lambda: self._log(f'Port {LISTEN_PORT} in use! Close other apps using it. Error: {e}'))
+
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+
+    def _check_connection_loop(self):
+        now = time.time()
+        if self.last_push_time > 0 and (now - self.last_push_time) < 15:
+            self.conn_indicator.configure(fg='#44dd44')
+        else:
+            self.conn_indicator.configure(fg='#ff4444')
+        self.root.after(5000, self._check_connection_loop)
+
+    def _handle_push(self, data):
+        self.push_count += 1
+        self.last_push_time = time.time()
+
+        queue_map = data.get('profileQueueMap', {})
+        link_map = data.get('profileLinkMap', {})
+        event_map = data.get('profileEventMap', {})
+        active_profiles = data.get('activeProfiles', [])
+
+        profile_info = {}
+        for p in active_profiles:
+            serial = str(p.get('serialNumber', p.get('serial_number', p.get('serialnumber', ''))))
+            uid = str(p.get('userId', p.get('user_id', '')))
+            name = str(p.get('name', ''))
+            custom_uid = str(p.get('customUserId', p.get('custom_user_id', '')))
+            key = serial or uid
+            if key:
+                profile_info[key] = {'serial': serial, 'name': name, 'uid': uid, 'custom_uid': custom_uid}
+
+        all_keys = set()
+        for k in list(queue_map.keys()) + list(link_map.keys()) + list(event_map.keys()) + list(profile_info.keys()):
+            all_keys.add(k)
+
+        current_keys = set()
+        for key in all_keys:
+            info = profile_info.get(key, {})
+            serial = info.get('serial', key)
+            name = info.get('name', '')
+            uid = info.get('uid', key)
+
+            if key not in self.profiles:
+                self.profiles[key] = ProfileRow(serial, name, uid)
+            else:
+                if name:
+                    self.profiles[key].name = name
+                if serial:
+                    self.profiles[key].serial = serial
+
+            p = self.profiles[key]
+            q = queue_map.get(key, 0)
+            if isinstance(q, (int, float)) and q > 0:
+                p.queue_num = int(q)
+                p.status = 'In Queue'
+                p.last_update = time.time()
+            elif key in queue_map:
+                p.queue_num = 0
+                p.status = 'Waiting'
+
+            if key in link_map:
+                p.link = str(link_map[key] or '')
+            if key in event_map:
+                evt = str(event_map[key] or '')
+                if evt:
+                    p.event = clean_event_title(evt, p.link)
+
+            if key in profile_info:
+                current_keys.add(key)
+
+        if active_profiles:
+            stale = [k for k in self.profiles if k not in current_keys and k not in queue_map]
+            for k in stale:
+                del self.profiles[k]
+
+        active_in_queue = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
+        self.status_label.configure(
+            text=f'{len(self.profiles)} profiles | {active_in_queue} in queue | Push #{self.push_count} | {time.strftime("%H:%M:%S")}')
+
+        self._render_table()
 
     def _render_table(self):
         for widget in self.table_inner.winfo_children():
@@ -380,7 +460,7 @@ class QueueDashboardApp:
             tk.Label(row, text=link_short or '--', font=('Segoe UI', 8),
                      fg='#666', bg=bg, width=28, anchor='w').pack(side='left', padx=1)
 
-            s_color = '#44dd44' if p.status == 'OK' else '#888'
+            s_color = '#44dd44' if p.status == 'In Queue' else '#888'
             tk.Label(row, text=p.status, font=('Segoe UI', 8),
                      fg=s_color, bg=bg, width=11, anchor='w').pack(side='left', padx=1)
 
@@ -390,220 +470,46 @@ class QueueDashboardApp:
                                    command=lambda uid=p.uid: self._close_profile(uid))
             close_btn.pack(side='left', padx=1)
 
-    def _scan_loop(self):
-        if not self.scanning:
-            self.scanning = True
-            threading.Thread(target=self._do_scan, daemon=True).start()
-        self.root.after(SCAN_INTERVAL * 1000, self._scan_loop)
-
-    def _do_scan(self):
-        try:
-            profiles_found = self._get_running_profiles()
-            if not profiles_found:
-                self.root.after(0, lambda: self.status_label.configure(
-                    text=f'No running profiles found'))
-                self.scanning = False
-                return
-
-            self.root.after(0, lambda c=len(profiles_found): self.status_label.configure(
-                text=f'Scanning {c} profiles...'))
-
-            current_keys = set()
-            for pdata in profiles_found:
-                serial = str(pdata.get('serial_number', pdata.get('serialnumber', '')))
-                uid = str(pdata.get('user_id', ''))
-                name = str(pdata.get('name', pdata.get('profile_name', '')))
-                debug_port = 0
-
-                dp = pdata.get('debug_port')
-                if dp:
-                    debug_port = int(str(dp))
-
-                if not debug_port:
-                    ws_url = ''
-                    ws = pdata.get('ws', {})
-                    if isinstance(ws, dict):
-                        ws_url = ws.get('puppeteer', ws.get('selenium', ''))
-                    if ws_url:
-                        try:
-                            m = re.search(r':(\d+)/', ws_url)
-                            if m:
-                                debug_port = int(m.group(1))
-                        except:
-                            pass
-
-                key = serial or uid
-                if not key:
-                    continue
-                current_keys.add(key)
-
-                if key not in self.profiles:
-                    self.profiles[key] = ProfileRow(serial, name, uid, debug_port)
-                else:
-                    self.profiles[key].debug_port = debug_port
-                    if name:
-                        self.profiles[key].name = name
-
-            stale = [k for k in self.profiles if k not in current_keys]
-            for k in stale:
-                del self.profiles[k]
-
-            for key, profile in self.profiles.items():
-                if not profile.debug_port:
-                    profile.status = 'No CDP'
-                    continue
-                self._scan_profile_queue(profile)
-                time.sleep(0.3)
-
-            active = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
-            self.root.after(0, lambda t=len(self.profiles), a=active: self.status_label.configure(
-                text=f'{t} profiles | {a} in queue | Last scan: {time.strftime("%H:%M:%S")}'))
-            self.root.after(0, self._render_table)
-
-        except Exception as e:
-            self.root.after(0, lambda: self._log(f'Scan error: {e}'))
-        finally:
-            self.scanning = False
-
-    def _get_running_profiles(self):
-        resp = api_get('/api/v1/browser/active?page=1&page_size=100')
-        if resp.get('code') == 0:
-            data = resp.get('data', {})
-            if isinstance(data, list):
-                lst = data
-            elif isinstance(data, dict):
-                lst = data.get('list', [])
-            else:
-                lst = []
-
-            if lst:
-                has_serial = any(p.get('serial_number') or p.get('serialnumber') for p in lst)
-                if not has_serial:
-                    lst = self._enrich_with_user_list(lst)
-                return lst
-
-        page = 1
-        all_profiles = []
-        while True:
-            r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
-            if r.get('code') != 0:
-                break
-            items = r.get('data', {}).get('list', [])
-            if not items:
-                break
-            all_profiles.extend(items)
-            page += 1
-            time.sleep(0.3)
-
-        running = []
-        for p in all_profiles:
-            uid = p.get('user_id', '')
-            if not uid:
-                continue
-            check = api_get(f'/api/v1/browser/active?user_id={uid}')
-            if check.get('code') == 0:
-                data = check.get('data', {})
-                if isinstance(data, dict) and data.get('status') == 'Active':
-                    p['debug_port'] = data.get('debug_port', 0)
-                    p['ws'] = data.get('ws', {})
-                    running.append(p)
-            time.sleep(0.2)
-
-        return running
-
-    def _enrich_with_user_list(self, active_list):
-        active_ids = {str(p.get('user_id', '')): p for p in active_list if p.get('user_id')}
-        r = api_get('/api/v1/user/list?page=1&page_size=100')
-        if r.get('code') != 0:
-            return active_list
-        all_users = r.get('data', {}).get('list', [])
-        enriched = []
-        for u in all_users:
-            uid = str(u.get('user_id', ''))
-            if uid in active_ids:
-                ap = active_ids[uid]
-                if not u.get('debug_port') and ap.get('debug_port'):
-                    u['debug_port'] = ap['debug_port']
-                if not u.get('ws') and ap.get('ws'):
-                    u['ws'] = ap['ws']
-                enriched.append(u)
-        return enriched if enriched else active_list
-
-    def _scan_profile_queue(self, profile):
-        port = profile.debug_port
-        if not port:
-            return
-
-        tabs = http_get_json(f'http://127.0.0.1:{port}/json')
-        if not tabs or not isinstance(tabs, list):
-            profile.status = 'No tabs'
-            return
-
-        tm_tabs = [t for t in tabs if t.get('webSocketDebuggerUrl') and
-                   t.get('type', 'page') == 'page' and
-                   is_tm_url(t.get('url', '') + ' ' + t.get('title', ''))]
-
-        any_tab = [t for t in tabs if t.get('webSocketDebuggerUrl') and
-                   t.get('type', 'page') == 'page' and
-                   not re.match(r'^(devtools:|chrome:|chrome-extension:|about:|edge:)', t.get('url', ''), re.IGNORECASE)]
-
-        if not tm_tabs and any_tab:
-            tab = any_tab[0]
-            profile.link = tab.get('url', '')
-            profile.event = clean_event_title(tab.get('title', ''), profile.link)
-            profile.status = 'No queue page'
-            return
-
-        if not tm_tabs:
-            profile.status = 'No tabs'
-            return
-
-        for tab in tm_tabs:
-            ws_url = tab.get('webSocketDebuggerUrl', '')
-            if not ws_url:
-                continue
-
-            profile.link = tab.get('url', '')
-            profile.event = clean_event_title(tab.get('title', ''), profile.link)
-
-            result = cdp_evaluate(ws_url, QUEUE_JS)
-            if result:
-                try:
-                    if isinstance(result, str):
-                        data = json.loads(result)
-                    else:
-                        data = result
-                    q = data.get('q', 0)
-                    if q and q > 0:
-                        profile.queue_num = q
-                        profile.link = data.get('u', profile.link)
-                        profile.event = clean_event_title(data.get('t', ''), profile.link)
-                        profile.status = 'OK'
-                        profile.last_update = time.time()
-                        return
-                except:
-                    pass
-
-            profile.status = 'Waiting'
-
     def _refresh_all(self):
         def do_refresh():
             self._log('Refreshing all profile tabs...')
-            for key, profile in self.profiles.items():
-                if not profile.debug_port:
+            resp = api_get('/api/v1/browser/active?page=1&page_size=100')
+            if resp.get('code') != 0:
+                self.root.after(0, lambda: self._log('Could not get active profiles from AdsPower'))
+                return
+
+            data = resp.get('data', {})
+            profiles = data.get('list', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            count = 0
+
+            for p in profiles:
+                debug_port = 0
+                dp = p.get('debug_port')
+                if dp:
+                    debug_port = int(str(dp))
+                if not debug_port:
+                    ws = p.get('ws', {})
+                    if isinstance(ws, dict):
+                        ws_url = ws.get('puppeteer', ws.get('selenium', ''))
+                        if ws_url:
+                            m = re.search(r':(\d+)/', ws_url)
+                            if m:
+                                debug_port = int(m.group(1))
+                if not debug_port:
                     continue
-                tabs = http_get_json(f'http://127.0.0.1:{profile.debug_port}/json')
+
+                tabs = http_get_json(f'http://127.0.0.1:{debug_port}/json')
                 if not tabs:
                     continue
                 for tab in tabs:
                     ws_url = tab.get('webSocketDebuggerUrl', '')
-                    if not ws_url:
-                        continue
-                    if tab.get('type', 'page') != 'page':
+                    if not ws_url or tab.get('type', 'page') != 'page':
                         continue
                     cdp_evaluate(ws_url, 'location.reload()')
+                    count += 1
                     time.sleep(0.2)
-            self.root.after(0, lambda: self._log('All tabs refreshed'))
+
+            self.root.after(0, lambda c=count: self._log(f'Refreshed {c} tabs'))
         threading.Thread(target=do_refresh, daemon=True).start()
 
     def _clear_data(self):
@@ -625,6 +531,9 @@ class QueueDashboardApp:
             resp = api_get(f'/api/v1/browser/stop?user_id={uid}')
             if resp.get('code') == 0:
                 self.root.after(0, lambda: self._log(f'Profile {uid} closed'))
+                if uid in self.profiles:
+                    del self.profiles[uid]
+                    self.root.after(0, self._render_table)
             else:
                 self.root.after(0, lambda m=resp.get('msg', ''): self._log(f'Close failed: {m}'))
         threading.Thread(target=do_close, daemon=True).start()
