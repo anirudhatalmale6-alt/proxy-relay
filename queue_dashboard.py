@@ -1,7 +1,7 @@
 """
-AdsPower Queue Dashboard v2.0
-Receives live queue data from the AdsPower Dashboard Chrome extension
-via HTTP POST on port 12345. Dark theme, APM-style standalone app.
+AdsPower Queue Dashboard v2.1
+Hybrid approach: polls AdsPower API for running profiles, receives queue
+data from the Dashboard Chrome extension via HTTP POST on port 12345.
 """
 
 import tkinter as tk
@@ -20,9 +20,10 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "2.0"
+VERSION = "2.1"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
+POLL_INTERVAL = 8
 
 _app_ref = None
 
@@ -226,11 +227,16 @@ class QueueDashboardApp:
         self.root.resizable(True, True)
         self.root.configure(bg='#1a1a2e')
         self.profiles = {}
+        self.queue_data = {}
+        self.link_data = {}
+        self.event_data = {}
         self.push_count = 0
         self.last_push_time = 0
+        self.polling = False
         self._build_ui()
         self._start_server()
         self._check_connection_loop()
+        self.root.after(2000, self._poll_loop)
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
@@ -254,7 +260,7 @@ class QueueDashboardApp:
         tk.Label(top, text=f'v{VERSION}',
                  font=('Segoe UI', 9), fg='#555', bg='#1a1a2e').pack(side='left', padx=8)
 
-        self.status_label = tk.Label(top, text='Waiting for extension...',
+        self.status_label = tk.Label(top, text='Starting...',
                                       font=('Segoe UI', 9), fg='#888', bg='#1a1a2e')
         self.status_label.pack(side='right')
 
@@ -332,7 +338,7 @@ class QueueDashboardApp:
                                  height=4, border=0, wrap='word', state='disabled')
         self.log_text.pack(fill='x')
 
-        self._log(f'Listening on port {LISTEN_PORT} for dashboard extension data...')
+        self._log(f'Listening on port {LISTEN_PORT} for extension data. Polling AdsPower for profiles...')
 
     def _start_server(self):
         global _app_ref
@@ -343,7 +349,7 @@ class QueueDashboardApp:
                 server = HTTPServer(('127.0.0.1', LISTEN_PORT), PushHandler)
                 server.serve_forever()
             except OSError as e:
-                self.root.after(0, lambda: self._log(f'Port {LISTEN_PORT} in use! Close other apps using it. Error: {e}'))
+                self.root.after(0, lambda: self._log(f'Port {LISTEN_PORT} in use! Error: {e}'))
 
         t = threading.Thread(target=run_server, daemon=True)
         t.start()
@@ -363,67 +369,151 @@ class QueueDashboardApp:
         queue_map = data.get('profileQueueMap', {})
         link_map = data.get('profileLinkMap', {})
         event_map = data.get('profileEventMap', {})
-        active_profiles = data.get('activeProfiles', [])
 
-        profile_info = {}
-        for p in active_profiles:
-            serial = str(p.get('serialNumber', p.get('serial_number', p.get('serialnumber', ''))))
-            uid = str(p.get('userId', p.get('user_id', '')))
-            name = str(p.get('name', ''))
-            custom_uid = str(p.get('customUserId', p.get('custom_user_id', '')))
-            key = serial or uid
-            if key:
-                profile_info[key] = {'serial': serial, 'name': name, 'uid': uid, 'custom_uid': custom_uid}
+        self.queue_data.update(queue_map)
+        self.link_data.update(link_map)
+        self.event_data.update(event_map)
 
-        all_keys = set()
-        for k in list(queue_map.keys()) + list(link_map.keys()) + list(event_map.keys()) + list(profile_info.keys()):
-            all_keys.add(k)
+        self._apply_extension_data()
 
-        current_keys = set()
-        for key in all_keys:
-            info = profile_info.get(key, {})
-            serial = info.get('serial', key)
-            name = info.get('name', '')
-            uid = info.get('uid', key)
+    def _apply_extension_data(self):
+        matched = 0
+        for key, profile in self.profiles.items():
+            lookup_keys = [key, profile.serial, profile.uid, profile.name]
+            lookup_keys = [k for k in lookup_keys if k]
 
-            if key not in self.profiles:
-                self.profiles[key] = ProfileRow(serial, name, uid)
-            else:
-                if name:
-                    self.profiles[key].name = name
-                if serial:
-                    self.profiles[key].serial = serial
+            for lk in lookup_keys:
+                q = self.queue_data.get(lk)
+                if q is not None and isinstance(q, (int, float)) and q > 0:
+                    profile.queue_num = int(q)
+                    profile.status = 'In Queue'
+                    profile.last_update = time.time()
+                    matched += 1
+                    break
 
-            p = self.profiles[key]
-            q = queue_map.get(key, 0)
-            if isinstance(q, (int, float)) and q > 0:
-                p.queue_num = int(q)
-                p.status = 'In Queue'
-                p.last_update = time.time()
-            elif key in queue_map:
-                p.queue_num = 0
-                p.status = 'Waiting'
+            for lk in lookup_keys:
+                link = self.link_data.get(lk)
+                if link:
+                    profile.link = str(link)
+                    break
 
-            if key in link_map:
-                p.link = str(link_map[key] or '')
-            if key in event_map:
-                evt = str(event_map[key] or '')
+            for lk in lookup_keys:
+                evt = self.event_data.get(lk)
                 if evt:
-                    p.event = clean_event_title(evt, p.link)
+                    profile.event = clean_event_title(str(evt), profile.link)
+                    break
 
-            if key in profile_info:
+        self._update_status_bar()
+        self._render_table()
+
+    def _poll_loop(self):
+        if not self.polling:
+            self.polling = True
+            threading.Thread(target=self._do_poll, daemon=True).start()
+        self.root.after(POLL_INTERVAL * 1000, self._poll_loop)
+
+    def _do_poll(self):
+        try:
+            profiles_found = self._get_running_profiles()
+            if not profiles_found:
+                self.root.after(0, lambda: self._update_status_bar())
+                self.polling = False
+                return
+
+            current_keys = set()
+            for pdata in profiles_found:
+                serial = str(pdata.get('serial_number', pdata.get('serialnumber', '')))
+                uid = str(pdata.get('user_id', ''))
+                name = str(pdata.get('name', pdata.get('profile_name', '')))
+                custom = str(pdata.get('custom_user_id', ''))
+
+                key = serial or uid
+                if not key:
+                    continue
                 current_keys.add(key)
 
-        if active_profiles:
-            stale = [k for k in self.profiles if k not in current_keys and k not in queue_map]
+                if key not in self.profiles:
+                    self.profiles[key] = ProfileRow(serial, name, uid)
+                    self.root.after(0, lambda s=serial, n=name: self._log(f'Found profile: {s} ({n})'))
+                else:
+                    if name:
+                        self.profiles[key].name = name
+                    if serial:
+                        self.profiles[key].serial = serial
+
+            stale = [k for k in self.profiles if k not in current_keys]
             for k in stale:
                 del self.profiles[k]
 
-        active_in_queue = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
-        self.status_label.configure(
-            text=f'{len(self.profiles)} profiles | {active_in_queue} in queue | Push #{self.push_count} | {time.strftime("%H:%M:%S")}')
+            self.root.after(0, self._apply_extension_data)
 
-        self._render_table()
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f'Poll error: {e}'))
+        finally:
+            self.polling = False
+
+    def _get_running_profiles(self):
+        resp = api_get('/api/v1/browser/active?page=1&page_size=100')
+        if resp.get('code') == 0:
+            data = resp.get('data', {})
+            if isinstance(data, list):
+                lst = data
+            elif isinstance(data, dict):
+                lst = data.get('list', [])
+            else:
+                lst = []
+
+            if lst:
+                has_serial = any(p.get('serial_number') or p.get('serialnumber') for p in lst)
+                if not has_serial:
+                    lst = self._enrich_with_user_list(lst)
+                return lst
+
+        page = 1
+        all_profiles = []
+        while True:
+            r = api_get(f'/api/v1/user/list?page={page}&page_size=100')
+            if r.get('code') != 0:
+                break
+            items = r.get('data', {}).get('list', [])
+            if not items:
+                break
+            all_profiles.extend(items)
+            page += 1
+            time.sleep(0.5)
+
+        running = []
+        for p in all_profiles:
+            uid = p.get('user_id', '')
+            if not uid:
+                continue
+            check = api_get(f'/api/v1/browser/active?user_id={uid}')
+            if check.get('code') == 0:
+                data_c = check.get('data', {})
+                if isinstance(data_c, dict) and data_c.get('status') == 'Active':
+                    running.append(p)
+            time.sleep(0.3)
+
+        return running
+
+    def _enrich_with_user_list(self, active_list):
+        active_ids = {str(p.get('user_id', '')): p for p in active_list if p.get('user_id')}
+        r = api_get('/api/v1/user/list?page=1&page_size=100')
+        if r.get('code') != 0:
+            return active_list
+        all_users = r.get('data', {}).get('list', [])
+        enriched = []
+        for u in all_users:
+            uid = str(u.get('user_id', ''))
+            if uid in active_ids:
+                enriched.append(u)
+        return enriched if enriched else active_list
+
+    def _update_status_bar(self):
+        active_in_queue = sum(1 for p in self.profiles.values() if p.queue_num and p.queue_num > 0)
+        ext = f' | Ext push #{self.push_count}' if self.push_count > 0 else ''
+        self.status_label.configure(
+            text=f'{len(self.profiles)} profiles | {active_in_queue} in queue{ext} | {time.strftime("%H:%M:%S")}')
 
     def _render_table(self):
         for widget in self.table_inner.winfo_children():
@@ -475,7 +565,7 @@ class QueueDashboardApp:
             self._log('Refreshing all profile tabs...')
             resp = api_get('/api/v1/browser/active?page=1&page_size=100')
             if resp.get('code') != 0:
-                self.root.after(0, lambda: self._log('Could not get active profiles from AdsPower'))
+                self.root.after(0, lambda: self._log('Could not get active profiles'))
                 return
 
             data = resp.get('data', {})
@@ -513,6 +603,9 @@ class QueueDashboardApp:
         threading.Thread(target=do_refresh, daemon=True).start()
 
     def _clear_data(self):
+        self.queue_data.clear()
+        self.link_data.clear()
+        self.event_data.clear()
         for p in self.profiles.values():
             p.queue_num = 0
             p.event = ''
