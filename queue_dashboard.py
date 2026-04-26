@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.3"
+VERSION = "3.4"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -430,8 +430,7 @@ class QueueDashboardApp:
         header_frame = tk.Frame(self.root, bg='#16213e')
         header_frame.pack(fill='x', padx=10, pady=(8, 0))
 
-        cols = [('#', 30), ('Port', 55), ('Serial', 70), ('Name', 150), ('Queue #', 70),
-                ('Event', 180), ('Link', 190), ('Status', 75), ('', 40)]
+        cols = [('Profile ID', 120), ('Queue #', 80), ('Link', 350), ('', 40)]
         for text, w in cols:
             tk.Label(header_frame, text=text, font=('Segoe UI', 9, 'bold'),
                      fg='#FFD700', bg='#16213e', width=w // 7, anchor='w').pack(side='left', padx=1)
@@ -790,35 +789,20 @@ class QueueDashboardApp:
             row = tk.Frame(self.table_inner, bg=bg)
             row.pack(fill='x', pady=0)
 
-            tk.Label(row, text=str(idx + 1), font=('Consolas', 9),
-                     fg='#666', bg=bg, width=4, anchor='w').pack(side='left', padx=1)
-
-            tk.Label(row, text=str(p.debug_port), font=('Consolas', 8),
-                     fg='#666', bg=bg, width=7, anchor='w').pack(side='left', padx=1)
-
-            tk.Label(row, text=p.serial or '--', font=('Consolas', 9),
-                     fg='#aaa', bg=bg, width=9, anchor='w').pack(side='left', padx=1)
-
-            tk.Label(row, text=(p.name or '--')[:20], font=('Segoe UI', 9),
-                     fg='#ddd', bg=bg, width=20, anchor='w').pack(side='left', padx=1)
+            profile_id = p.serial or p.name or str(p.debug_port)
+            tk.Label(row, text=profile_id, font=('Consolas', 9),
+                     fg='#aaa', bg=bg, width=16, anchor='w').pack(side='left', padx=1)
 
             q_color = '#44dd44' if p.queue_num and p.queue_num > 0 else '#666'
             q_text = str(p.queue_num) if p.queue_num and p.queue_num > 0 else '--'
             tk.Label(row, text=q_text, font=('Consolas', 11, 'bold'),
-                     fg=q_color, bg=bg, width=9, anchor='w').pack(side='left', padx=1)
-
-            tk.Label(row, text=(p.event or '--')[:25], font=('Segoe UI', 9),
-                     fg='#88aaff', bg=bg, width=25, anchor='w').pack(side='left', padx=1)
+                     fg=q_color, bg=bg, width=10, anchor='w').pack(side='left', padx=1)
 
             link_short = ''
             if p.link:
-                link_short = p.link.split('?')[0][-30:]
+                link_short = p.link.split('?')[0][-50:]
             tk.Label(row, text=link_short or '--', font=('Segoe UI', 8),
-                     fg='#666', bg=bg, width=26, anchor='w').pack(side='left', padx=1)
-
-            s_color = '#44dd44' if p.status == 'In Queue' else '#888'
-            tk.Label(row, text=p.status, font=('Segoe UI', 8),
-                     fg=s_color, bg=bg, width=10, anchor='w').pack(side='left', padx=1)
+                     fg='#88aaff', bg=bg, width=48, anchor='w').pack(side='left', padx=1)
 
             close_btn = tk.Button(row, text='X', font=('Segoe UI', 7, 'bold'),
                                    fg='#ff4444', bg=bg, border=0, padx=4,
@@ -866,9 +850,18 @@ class QueueDashboardApp:
             resp = api_get(f'/api/v1/browser/stop?user_id={uid}')
             if resp.get('code') == 0:
                 self.root.after(0, lambda: self._log(f'Profile {uid} closed'))
+                self.root.after(0, lambda: self._remove_profile_by_uid(uid))
             else:
                 self.root.after(0, lambda m=resp.get('msg', ''): self._log(f'Close failed: {m}'))
         threading.Thread(target=do_close, daemon=True).start()
+
+    def _remove_profile_by_uid(self, uid):
+        keys_to_remove = [k for k, p in self.profiles.items() if p.uid == uid]
+        for k in keys_to_remove:
+            del self.profiles[k]
+        if keys_to_remove:
+            self._update_status_bar()
+            self._render_table()
 
     def _capture_screenshot(self):
         """Capture the dashboard window as BMP bytes using Win32 API."""
@@ -985,11 +978,13 @@ class QueueDashboardApp:
 
             if in_queue > 0:
                 lines.append('```')
-                lines.append(f'{"#":<7} {"Name":<22} {"Queue":<8} {"Event":<30}')
-                lines.append('-' * 68)
+                lines.append(f'{"Profile ID":<16} {"Queue #":<10} {"Link":<40}')
+                lines.append('-' * 66)
                 for p in sorted_p:
                     if p.queue_num and p.queue_num > 0:
-                        lines.append(f'{(p.serial or "--"):<7} {(p.name or "--")[:22]:<22} {str(p.queue_num):<8} {(p.event or "--")[:30]:<30}')
+                        pid = p.serial or p.name or str(p.debug_port)
+                        link = (p.link.split('?')[0][-40:]) if p.link else '--'
+                        lines.append(f'{pid:<16} {str(p.queue_num):<10} {link:<40}')
                 lines.append('```')
 
             content = '\n'.join(lines)
