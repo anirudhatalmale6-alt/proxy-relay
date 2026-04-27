@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.6"
+VERSION = "3.7"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -407,22 +407,24 @@ class QueueDashboardApp:
         discord_frame = tk.Frame(btn_frame, bg='#1a1a2e')
         discord_frame.pack(side='right')
 
-        tk.Label(discord_frame, text='Discord:', font=('Segoe UI', 8),
-                 fg='#888', bg='#1a1a2e').pack(side='left')
+        tk.Label(discord_frame, text='VA Name:', font=('Segoe UI', 8),
+                 fg='#ff4444', bg='#1a1a2e').pack(side='left')
         self.discord_name_entry = tk.Entry(discord_frame, font=('Segoe UI', 8),
                                             bg='#0a0a1a', fg='#fff', insertbackground='#fff',
                                             width=10, border=1)
         self.discord_name_entry.pack(side='left', padx=2)
-        self.discord_name_entry.insert(0, 'Name')
+        self.discord_name_entry.insert(0, 'VA Name')
 
+        tk.Label(discord_frame, text='Discord URL:', font=('Segoe UI', 8),
+                 fg='#FFD700', bg='#1a1a2e').pack(side='left', padx=(4, 0))
         self.discord_hook_entry = tk.Entry(discord_frame, font=('Segoe UI', 8),
                                             bg='#0a0a1a', fg='#fff', insertbackground='#fff',
                                             width=30, border=1, show='*')
         self.discord_hook_entry.pack(side='left', padx=2)
-        self.discord_hook_entry.insert(0, 'Webhook URL')
+        self.discord_hook_entry.insert(0, 'Discord URL')
         self.discord_hook_entry.bind('<FocusIn>', lambda e: (
             self.discord_hook_entry.configure(show=''),
-            self.discord_hook_entry.delete(0, 'end') if self.discord_hook_entry.get() == 'Webhook URL' else None
+            self.discord_hook_entry.delete(0, 'end') if self.discord_hook_entry.get() == 'Discord URL' else None
         ))
 
         tk.Button(discord_frame, text='Send', font=('Segoe UI', 8, 'bold'),
@@ -971,10 +973,10 @@ class QueueDashboardApp:
     def _send_discord(self):
         name = self.discord_name_entry.get().strip()
         webhook = self.discord_hook_entry.get().strip()
-        if not name or name == 'Name':
-            self._log('Enter your Discord name first')
+        if not name or name == 'VA Name':
+            self._log('Enter your VA Name first')
             return
-        if not webhook or webhook == 'Webhook URL' or 'discord.com/api/webhooks' not in webhook:
+        if not webhook or webhook == 'Discord URL' or 'discord.com/api/webhooks' not in webhook:
             self._log('Enter a valid Discord webhook URL')
             return
 
@@ -997,8 +999,12 @@ class QueueDashboardApp:
                 for p in sorted_p:
                     if p.queue_num and p.queue_num > 0:
                         pid = p.serial or p.name or str(p.debug_port)
-                        link = (p.link.split('?')[0][-40:]) if p.link else '--'
-                        lines.append(f'{pid:<16} {str(p.queue_num):<10} {link:<40}')
+                        link_text = p.tab_title or p.event or ''
+                        if link_text:
+                            link_text = re.sub(r'\s*[|\-–—]\s*(?:ticketmaster|livenation).*$', '', link_text, flags=re.IGNORECASE).strip()
+                        if not link_text and p.link:
+                            link_text = p.link.split('?')[0][-40:]
+                        lines.append(f'{pid:<16} {str(p.queue_num):<10} {(link_text or "--")[:40]:<40}')
                 lines.append('```')
 
             content = '\n'.join(lines)
