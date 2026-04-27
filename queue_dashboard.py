@@ -25,7 +25,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.5"
+VERSION = "5.6"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -1131,8 +1131,6 @@ class QueueDashboardApp:
                      fg=q_color, bg=bg, width=10, anchor='w').pack(side='left', padx=1)
 
             link_display = p.tab_title or p.event or ''
-            if link_display:
-                link_display = re.sub(r'\s*[|\-–—]\s*(?:ticketmaster|livenation).*$', '', link_display, flags=re.IGNORECASE).strip()
             if not link_display and p.link:
                 link_display = p.link.split('?')[0][-50:]
             tk.Label(row, text=(link_display or '--')[:60], font=('Segoe UI', 9),
