@@ -15,6 +15,7 @@ import socket
 import subprocess
 import os
 import sys
+import html as html_mod
 
 try:
     import urllib.request
@@ -25,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.6"
+VERSION = "5.7"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -462,6 +463,10 @@ class QueueDashboardApp:
         tk.Button(btn_frame, text='Clear Data', font=('Segoe UI', 9),
                   fg='#fff', bg='#333', border=0, padx=10, pady=4,
                   cursor='hand2', command=self._clear_data).pack(side='left', padx=2)
+
+        tk.Button(btn_frame, text='CLOSE ALL', font=('Segoe UI', 9, 'bold'),
+                  fg='#fff', bg='#dc3545', border=0, padx=10, pady=4,
+                  cursor='hand2', command=self._close_all_profiles).pack(side='left', padx=2)
 
         discord_frame = tk.Frame(btn_frame, bg='#1a1a2e')
         discord_frame.pack(side='right')
@@ -944,6 +949,8 @@ class QueueDashboardApp:
                         continue
                     if uid:
                         new_map[f'uid:{uid}'] = serial
+                    if uid and serial:
+                        new_map[f'serial:{serial}'] = uid
                     email = self._extract_email(name)
                     if email:
                         new_map[f'email:{email}'] = serial
@@ -1130,7 +1137,7 @@ class QueueDashboardApp:
             tk.Label(row, text=q_text, font=('Consolas', 11, 'bold'),
                      fg=q_color, bg=bg, width=10, anchor='w').pack(side='left', padx=1)
 
-            link_display = p.tab_title or p.event or ''
+            link_display = html_mod.unescape(p.tab_title or p.event or '')
             if not link_display and p.link:
                 link_display = p.link.split('?')[0][-50:]
             tk.Label(row, text=(link_display or '--')[:60], font=('Segoe UI', 9),
@@ -1139,7 +1146,7 @@ class QueueDashboardApp:
             close_btn = tk.Button(row, text='X', font=('Segoe UI', 7, 'bold'),
                                    fg='#ff4444', bg=bg, border=0, padx=4,
                                    cursor='hand2',
-                                   command=lambda uid=p.uid: self._close_profile(uid))
+                                   command=lambda uid=p.uid, serial=p.serial: self._close_profile(uid, serial))
             close_btn.pack(side='left', padx=1)
 
     def _refresh_all(self):
@@ -1172,20 +1179,53 @@ class QueueDashboardApp:
         self._render_table()
         self._log('Queue data cleared')
 
-    def _close_profile(self, uid):
-        if not uid:
+    def _resolve_uid(self, uid, serial=''):
+        if uid:
+            return uid
+        if serial and self._profile_map:
+            return self._profile_map.get(f'serial:{serial}', '')
+        return ''
+
+    def _close_profile(self, uid, serial=''):
+        close_uid = self._resolve_uid(uid, serial)
+        display = serial or close_uid or '?'
+        if not close_uid:
+            self._log(f'Cannot close #{display}: no user ID')
             return
-        if not messagebox.askyesno('Close Profile', f'Close profile {uid}?'):
+        if not messagebox.askyesno('Close Profile', f'Close profile #{display}?'):
             return
 
         def do_close():
-            resp = api_get(f'/api/v1/browser/stop?user_id={uid}')
+            resp = api_get(f'/api/v1/browser/stop?user_id={close_uid}')
             if resp.get('code') == 0:
-                self.root.after(0, lambda: self._log(f'Profile {uid} closed'))
-                self.root.after(0, lambda: self._remove_profile_by_uid(uid))
+                self.root.after(0, lambda: self._log(f'Profile #{display} closed'))
+                self.root.after(0, lambda: self._remove_profile_by_uid(close_uid))
             else:
                 self.root.after(0, lambda m=resp.get('msg', ''): self._log(f'Close failed: {m}'))
         threading.Thread(target=do_close, daemon=True).start()
+
+    def _close_all_profiles(self):
+        if not self.profiles:
+            self._log('No profiles to close')
+            return
+        count = len(self.profiles)
+        if not messagebox.askyesno('Close All', f'Close all {count} profiles?'):
+            return
+
+        def do_close_all():
+            closed = 0
+            for key, profile in list(self.profiles.items()):
+                close_uid = self._resolve_uid(profile.uid, profile.serial)
+                if close_uid:
+                    resp = api_get(f'/api/v1/browser/stop?user_id={close_uid}')
+                    if resp.get('code') == 0:
+                        closed += 1
+                    time.sleep(0.3)
+            self.root.after(0, lambda c=closed: self._log(f'Closed {c}/{count} profiles'))
+            self.root.after(0, lambda: self.profiles.clear())
+            self.root.after(0, self._render_table)
+            self.root.after(0, self._update_status_bar)
+        threading.Thread(target=do_close_all, daemon=True).start()
 
     def _remove_profile_by_uid(self, uid):
         keys_to_remove = [k for k, p in self.profiles.items() if p.uid == uid]
