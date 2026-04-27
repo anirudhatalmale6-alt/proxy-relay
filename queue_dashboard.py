@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.3"
+VERSION = "4.4"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -357,7 +357,8 @@ class QueueDashboardApp:
         self._build_ui()
         self._start_server()
         self._check_connection_loop()
-        self.root.after(1500, self._scan_loop)
+        self.root.after(100, self._force_scan)
+        self.root.after(SCAN_INTERVAL * 1000, self._scan_loop)
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
