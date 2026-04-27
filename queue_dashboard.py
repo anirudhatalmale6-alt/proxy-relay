@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.9"
+VERSION = "5.0"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -531,6 +531,26 @@ class QueueDashboardApp:
         link_map = data.get('profileLinkMap', {})
         event_map = data.get('profileEventMap', {})
         active_profiles = data.get('activeProfiles', [])
+        dom_profiles = data.get('domProfiles', [])
+
+        if dom_profiles:
+            name_serial = {}
+            for dp in dom_profiles:
+                serial = str(dp.get('serial', ''))
+                name = str(dp.get('name', '')).lower().strip()
+                if serial and name:
+                    name_serial[name] = serial
+            matched = 0
+            for key, profile in self.profiles.items():
+                if profile.serial:
+                    continue
+                pname = (profile.name or '').lower().strip()
+                if pname and pname in name_serial:
+                    profile.serial = name_serial[pname]
+                    profile.ext_keys.add('s:' + profile.serial)
+                    matched += 1
+            if matched and self.push_count <= 5:
+                self._log(f'DOM push: matched {matched} Custom # from dashboard')
 
         if active_profiles:
             uid_serial = {}
@@ -544,8 +564,6 @@ class QueueDashboardApp:
                     if not profile.serial and profile.uid and profile.uid in uid_serial:
                         profile.serial = uid_serial[profile.uid]
                         profile.ext_keys.add('s:' + profile.serial)
-                if self.push_count <= 3:
-                    self._log(f'Extension push: {len(uid_serial)} profiles with Custom #')
 
         if self.push_count <= 3:
             self._log(f'Extension push #{self.push_count}: Q={len(queue_map)} L={len(link_map)} E={len(event_map)}')
