@@ -1,5 +1,5 @@
 """
-AdsPower Queue Dashboard v5.12
+AdsPower Queue Dashboard v5.13
 Scans for Chrome debug ports, evaluates queue JS via CDP.
 Profile map cache: fetches ALL profiles from AdsPower API on startup,
 builds uid/email/name -> Custom# mapping, cached to profile_map.json.
@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.12"
+VERSION = "5.13"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -423,11 +423,12 @@ class PushHandler(BaseHTTPRequestHandler):
 
 
 class ProfileRow:
-    def __init__(self, debug_port, name='', serial='', uid=''):
+    def __init__(self, debug_port, name='', serial='', uid='', pid=''):
         self.debug_port = debug_port
         self.serial = serial
         self.name = name
         self.uid = uid
+        self.pid = pid
         self.queue_num = 0
         self.event = ''
         self.link = ''
@@ -758,6 +759,7 @@ class QueueDashboardApp:
                     port = info.get('debug_port', 0)
                     serial = info.get('serial', '')
                     name = info.get('name', '')
+                    pid = info.get('pid', '')
 
                     if uid and uid in self._closed_uids:
                         continue
@@ -771,7 +773,7 @@ class QueueDashboardApp:
                             if uid and uid in self._closed_uids:
                                 continue
 
-                        p = ProfileRow(port, name, serial, uid)
+                        p = ProfileRow(port, name, serial, uid, pid)
                         if uid:
                             p.ext_keys.add('u:' + uid)
                         if serial:
@@ -786,6 +788,8 @@ class QueueDashboardApp:
                             p.name = name
                         if port and not p.debug_port:
                             p.debug_port = port
+                        if pid:
+                            p.pid = pid
 
                 stale = [k for k in self.profiles if k not in active_keys]
                 for k in stale:
@@ -863,7 +867,7 @@ class QueueDashboardApp:
                     src = 'tabs'
                 if uid:
                     self.root.after(0, lambda p=port, u=uid, s=src: self._log(f'Port {p}: uid={u} ({s})'))
-                results.append({'user_id': uid or '', 'serial': '', 'name': '', 'debug_port': port})
+                results.append({'user_id': uid or '', 'serial': '', 'name': '', 'debug_port': port, 'pid': pid})
             if len(results) >= 200:
                 break
 
@@ -1210,7 +1214,7 @@ class QueueDashboardApp:
             close_btn = tk.Button(row, text='X', font=('Segoe UI', 7, 'bold'),
                                    fg='#ff4444', bg=bg, border=0, padx=4,
                                    cursor='hand2',
-                                   command=lambda uid=p.uid, serial=p.serial, port=p.debug_port: self._close_profile(uid, serial, port))
+                                   command=lambda uid=p.uid, serial=p.serial, port=p.debug_port, pid=p.pid: self._close_profile(uid, serial, port, pid))
             close_btn.pack(side='left', padx=1)
 
     def _refresh_all(self):
@@ -1250,24 +1254,25 @@ class QueueDashboardApp:
             return self._profile_map.get(f'serial:{serial}', '')
         return ''
 
-    def _stop_profile_browser(self, close_uid, debug_port=0):
+    def _stop_profile_browser(self, close_uid, debug_port=0, stored_pid=''):
         """Stop a profile's browser. Tries API first, then kills the process."""
         for base in [API_BASE, 'http://local.adspower.net:50325']:
             r = http_get_json(f'{base}/api/v1/browser/stop?user_id={close_uid}', timeout=10)
             if r and r.get('code') == 0:
                 return 'api'
 
-        if debug_port:
+        pid = stored_pid or ''
+        if not pid and debug_port:
             pid = self._find_pid_for_port(debug_port)
-            if pid:
-                try:
-                    subprocess.check_output(
-                        f'taskkill /PID {pid} /F /T',
-                        shell=True, timeout=10, stderr=subprocess.DEVNULL
-                    )
-                    return 'kill'
-                except:
-                    pass
+        if pid:
+            try:
+                subprocess.check_output(
+                    f'taskkill /PID {pid} /F /T',
+                    shell=True, timeout=10, stderr=subprocess.DEVNULL
+                )
+                return 'kill'
+            except:
+                pass
         return ''
 
     def _find_pid_for_port(self, port):
@@ -1285,7 +1290,7 @@ class QueueDashboardApp:
             pass
         return ''
 
-    def _close_profile(self, uid, serial='', debug_port=0):
+    def _close_profile(self, uid, serial='', debug_port=0, stored_pid=''):
         close_uid = self._resolve_uid(uid, serial)
         display = serial or close_uid or '?'
         if not close_uid and not debug_port:
@@ -1295,7 +1300,7 @@ class QueueDashboardApp:
             return
 
         def do_close():
-            method = self._stop_profile_browser(close_uid, debug_port)
+            method = self._stop_profile_browser(close_uid, debug_port, stored_pid)
             if close_uid:
                 self._closed_uids[close_uid] = time.time()
             if method:
@@ -1319,7 +1324,7 @@ class QueueDashboardApp:
             closed = 0
             for key, profile in list(self.profiles.items()):
                 close_uid = self._resolve_uid(profile.uid, profile.serial)
-                method = self._stop_profile_browser(close_uid, profile.debug_port)
+                method = self._stop_profile_browser(close_uid, profile.debug_port, profile.pid)
                 if close_uid:
                     self._closed_uids[close_uid] = time.time()
                 if method:
