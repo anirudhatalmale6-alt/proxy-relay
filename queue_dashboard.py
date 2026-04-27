@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.5"
+VERSION = "3.6"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -334,6 +334,7 @@ class ProfileRow:
         self.event = ''
         self.link = ''
         self.link_from_cdp = False
+        self.tab_title = ''
         self.status = 'Scanning...'
         self.last_update = 0
         self.ext_keys = set()
@@ -745,7 +746,8 @@ class QueueDashboardApp:
 
                 profile.link = tab.get('url', '')
                 profile.link_from_cdp = True
-                profile.event = clean_event_title(tab.get('title', ''), profile.link)
+                profile.tab_title = tab.get('title', '')
+                profile.event = clean_event_title(profile.tab_title, profile.link)
 
                 result = cdp_evaluate(ws_url, QUEUE_JS)
                 if result:
@@ -756,7 +758,10 @@ class QueueDashboardApp:
                             profile.queue_num = q
                             profile.link = data.get('u', profile.link)
                             profile.link_from_cdp = True
-                            profile.event = clean_event_title(data.get('t', ''), profile.link)
+                            raw_t = data.get('t', '')
+                            if raw_t:
+                                profile.tab_title = raw_t
+                            profile.event = clean_event_title(profile.tab_title, profile.link)
                             profile.status = 'In Queue'
                             profile.last_update = time.time()
                             return True
@@ -773,7 +778,8 @@ class QueueDashboardApp:
                     break
             profile.link = best.get('url', '')
             profile.link_from_cdp = True
-            profile.event = clean_event_title(best.get('title', ''), profile.link)
+            profile.tab_title = best.get('title', '')
+            profile.event = clean_event_title(profile.tab_title, profile.link)
             profile.status = 'No TM page'
         return True
 
@@ -804,10 +810,12 @@ class QueueDashboardApp:
             tk.Label(row, text=q_text, font=('Consolas', 11, 'bold'),
                      fg=q_color, bg=bg, width=10, anchor='w').pack(side='left', padx=1)
 
-            link_short = ''
-            if p.link:
-                link_short = p.link.split('?')[0][-50:]
-            tk.Label(row, text=link_short or '--', font=('Segoe UI', 8),
+            link_display = p.tab_title or p.event or ''
+            if link_display:
+                link_display = re.sub(r'\s*[|\-–—]\s*(?:ticketmaster|livenation).*$', '', link_display, flags=re.IGNORECASE).strip()
+            if not link_display and p.link:
+                link_display = p.link.split('?')[0][-50:]
+            tk.Label(row, text=(link_display or '--')[:60], font=('Segoe UI', 9),
                      fg='#88aaff', bg=bg, width=48, anchor='w').pack(side='left', padx=1)
 
             close_btn = tk.Button(row, text='X', font=('Segoe UI', 7, 'bold'),
