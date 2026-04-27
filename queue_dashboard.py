@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.8"
+VERSION = "5.9"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -1157,7 +1157,7 @@ class QueueDashboardApp:
             close_btn = tk.Button(row, text='X', font=('Segoe UI', 7, 'bold'),
                                    fg='#ff4444', bg=bg, border=0, padx=4,
                                    cursor='hand2',
-                                   command=lambda uid=p.uid, serial=p.serial: self._close_profile(uid, serial))
+                                   command=lambda uid=p.uid, serial=p.serial, port=p.debug_port: self._close_profile(uid, serial, port))
             close_btn.pack(side='left', padx=1)
 
     def _refresh_all(self):
@@ -1197,23 +1197,61 @@ class QueueDashboardApp:
             return self._profile_map.get(f'serial:{serial}', '')
         return ''
 
-    def _close_profile(self, uid, serial=''):
+    def _stop_profile_browser(self, close_uid, debug_port=0):
+        """Stop a profile's browser. Tries API first, then kills the process."""
+        for base in [API_BASE, 'http://local.adspower.net:50325']:
+            r = http_get_json(f'{base}/api/v1/browser/stop?user_id={close_uid}', timeout=10)
+            if r and r.get('code') == 0:
+                return 'api'
+
+        if debug_port:
+            pid = self._find_pid_for_port(debug_port)
+            if pid:
+                try:
+                    subprocess.check_output(
+                        f'taskkill /PID {pid} /F /T',
+                        shell=True, timeout=10, stderr=subprocess.DEVNULL
+                    )
+                    return 'kill'
+                except:
+                    pass
+        return ''
+
+    def _find_pid_for_port(self, port):
+        """Find the process ID listening on a given port."""
+        try:
+            output = subprocess.check_output(
+                f'netstat -ano | findstr "LISTENING" | findstr "127.0.0.1:{port}"',
+                shell=True, timeout=5, stderr=subprocess.DEVNULL
+            ).decode('utf-8', errors='ignore')
+            for line in output.strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 5:
+                    return parts[4].strip()
+        except:
+            pass
+        return ''
+
+    def _close_profile(self, uid, serial='', debug_port=0):
         close_uid = self._resolve_uid(uid, serial)
         display = serial or close_uid or '?'
-        if not close_uid:
+        if not close_uid and not debug_port:
             self._log(f'Cannot close #{display}: no user ID')
             return
         if not messagebox.askyesno('Close Profile', f'Close profile #{display}?'):
             return
 
         def do_close():
-            resp = api_get(f'/api/v1/browser/stop?user_id={close_uid}')
-            if resp.get('code') == 0:
+            method = self._stop_profile_browser(close_uid, debug_port)
+            if close_uid:
                 self._closed_uids[close_uid] = time.time()
-                self.root.after(0, lambda: self._log(f'Profile #{display} closed'))
-                self.root.after(0, lambda u=close_uid, s=serial: self._remove_profile(u, s))
+            if method:
+                self.root.after(0, lambda m=method: self._log(
+                    f'Profile #{display} stopped ({m})'))
             else:
-                self.root.after(0, lambda m=resp.get('msg', ''): self._log(f'Close failed: {m}'))
+                self.root.after(0, lambda: self._log(
+                    f'Profile #{display} removed (could not stop browser)'))
+            self.root.after(0, lambda u=close_uid, s=serial: self._remove_profile(u, s))
         threading.Thread(target=do_close, daemon=True).start()
 
     def _close_all_profiles(self):
@@ -1228,13 +1266,13 @@ class QueueDashboardApp:
             closed = 0
             for key, profile in list(self.profiles.items()):
                 close_uid = self._resolve_uid(profile.uid, profile.serial)
+                method = self._stop_profile_browser(close_uid, profile.debug_port)
                 if close_uid:
-                    resp = api_get(f'/api/v1/browser/stop?user_id={close_uid}')
-                    if resp.get('code') == 0:
-                        self._closed_uids[close_uid] = time.time()
-                        closed += 1
-                    time.sleep(0.3)
-            self.root.after(0, lambda c=closed: self._log(f'Closed {c}/{count} profiles'))
+                    self._closed_uids[close_uid] = time.time()
+                if method:
+                    closed += 1
+                time.sleep(0.3)
+            self.root.after(0, lambda c=closed: self._log(f'Stopped {c}/{count} profiles'))
             self.root.after(0, lambda: self.profiles.clear())
             self.root.after(0, self._render_table)
             self.root.after(0, self._update_status_bar)
