@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.8"
+VERSION = "4.9"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -256,18 +256,24 @@ def find_chrome_debug_ports():
 
 
 def get_uid_from_pid(pid):
-    """Extract AdsPower user_id from Chrome process command line via WMIC."""
+    """Extract AdsPower user_id from Chrome process command line."""
     try:
         output = subprocess.check_output(
             f'wmic process where "processid={pid}" get commandline /format:list',
             shell=True, timeout=5, stderr=subprocess.DEVNULL
         ).decode('utf-8', errors='ignore')
-        m = re.search(r'user-data-dir[=\\/"]+.*?([a-z0-9]{8,})', output, re.IGNORECASE)
-        if m:
-            return m.group(1)
-        m = re.search(r'cache_path[=\\/"]+.*?([a-z0-9]{8,})', output, re.IGNORECASE)
-        if m:
-            return m.group(1)
+        for pattern in [
+            r'[/\\]([a-z][a-z0-9]{6,})[/\\](?:Default|Cache|Preferences)',
+            r'user-data-dir[=\\/"\']+[^"]*?[/\\]([a-z][a-z0-9]{6,})',
+            r'(?:adspower|AdsRower|SunBrowser)[^"]*?[/\\]([a-z][a-z0-9]{6,})',
+            r'profile-directory[=\\/"\']+([a-z][a-z0-9]{6,})',
+        ]:
+            m = re.search(pattern, output, re.IGNORECASE)
+            if m:
+                uid = m.group(1).lower()
+                if uid not in ('default', 'appdata', 'roaming', 'local', 'google', 'chrome',
+                               'chromium', 'sunbrowser', 'adspower', 'adsrower', 'program', 'windows'):
+                    return uid
     except:
         pass
     return ''
@@ -524,6 +530,22 @@ class QueueDashboardApp:
         queue_map = data.get('profileQueueMap', {})
         link_map = data.get('profileLinkMap', {})
         event_map = data.get('profileEventMap', {})
+        active_profiles = data.get('activeProfiles', [])
+
+        if active_profiles:
+            uid_serial = {}
+            for ap in active_profiles:
+                uid = ap.get('userId', '')
+                serial = ap.get('serialNumber', '') or ap.get('customUserId', '')
+                if uid and serial:
+                    uid_serial[uid] = serial
+            if uid_serial:
+                for key, profile in self.profiles.items():
+                    if not profile.serial and profile.uid and profile.uid in uid_serial:
+                        profile.serial = uid_serial[profile.uid]
+                        profile.ext_keys.add('s:' + profile.serial)
+                if self.push_count <= 3:
+                    self._log(f'Extension push: {len(uid_serial)} profiles with Custom #')
 
         if self.push_count <= 3:
             self._log(f'Extension push #{self.push_count}: Q={len(queue_map)} L={len(link_map)} E={len(event_map)}')
@@ -669,8 +691,12 @@ class QueueDashboardApp:
         for port, pid in port_pid.items():
             if check_debug_port(port):
                 uid = get_uid_from_pid(pid)
+                src = 'wmic'
                 if not uid:
                     uid = self._get_uid_from_tabs(port)
+                    src = 'tabs'
+                if uid:
+                    self.root.after(0, lambda p=port, u=uid, s=src: self._log(f'Port {p}: uid={u} ({s})'))
                 results.append({'user_id': uid or '', 'serial': '', 'name': '', 'debug_port': port})
             if len(results) >= 200:
                 break
@@ -683,15 +709,21 @@ class QueueDashboardApp:
         return results
 
     def _get_uid_from_tabs(self, debug_port):
-        """Extract AdsPower user_id from start.adspower.net tab URL."""
+        """Extract AdsPower user_id from browser targets."""
         tabs = http_get_json(f'http://127.0.0.1:{debug_port}/json')
-        if tabs and isinstance(tabs, list):
-            for tab in tabs:
-                url = tab.get('url', '')
-                if 'start.adspower.net' in url or 'start.adspower.com' in url:
-                    m = re.search(r'[?&]id=([^&]+)', url)
-                    if m:
-                        return m.group(1)
+        if not tabs or not isinstance(tabs, list):
+            return ''
+        for tab in tabs:
+            url = tab.get('url', '')
+            if 'start.adspower' in url:
+                m = re.search(r'[?&]id=([^&]+)', url)
+                if m:
+                    return m.group(1)
+        for tab in tabs:
+            url = tab.get('url', '')
+            m = re.search(r'[?&](?:user_id|profile_id|id)=([a-z][a-z0-9]{6,})', url)
+            if m and 'adspower' in url:
+                return m.group(1)
         return ''
 
     def _fetch_serial_for_profile(self, profile):
