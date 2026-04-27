@@ -1,5 +1,5 @@
 """
-AdsPower Queue Dashboard v5.5
+AdsPower Queue Dashboard v5.12
 Scans for Chrome debug ports, evaluates queue JS via CDP.
 Profile map cache: fetches ALL profiles from AdsPower API on startup,
 builds uid/email/name -> Custom# mapping, cached to profile_map.json.
@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.11"
+VERSION = "5.12"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -237,27 +237,63 @@ def strip_prefix(key):
 
 
 def find_chrome_debug_ports():
-    """Find Chrome/Chromium debug ports and their PIDs via netstat."""
+    """Find Chrome/Chromium debug ports via multiple methods."""
     port_pid = {}
-    try:
-        output = subprocess.check_output(
-            'netstat -ano | findstr "LISTENING"',
-            shell=True, timeout=5, stderr=subprocess.DEVNULL
-        ).decode('utf-8', errors='ignore')
-        for line in output.strip().split('\n'):
-            parts = line.split()
-            if len(parts) >= 5:
-                addr = parts[1]
-                pid = parts[4].strip()
-                if ':' in addr:
-                    try:
-                        port = int(addr.split(':')[-1])
-                        if 10000 <= port <= 60000 and port != LISTEN_PORT and port != 50325:
-                            port_pid[port] = pid
-                    except:
-                        pass
-    except:
-        pass
+
+    # Method 1: Search Chrome process command lines for --remote-debugging-port
+    for cmd in [
+        'wmic process where "commandline like \'%%remote-debugging-port%%\'" get processid,commandline /format:list',
+        'powershell -Command "Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -match \'remote-debugging-port\'} | ForEach-Object { Write-Output (\'ProcessId=\' + [string]$_.ProcessId); Write-Output (\'CommandLine=\' + $_.CommandLine); Write-Output \'\' }"',
+    ]:
+        try:
+            output = subprocess.check_output(
+                cmd, shell=True, timeout=15, stderr=subprocess.DEVNULL
+            ).decode('utf-8', errors='ignore')
+            current_pid = ''
+            current_port = 0
+            for line in output.split('\n'):
+                line = line.strip()
+                if line.startswith('ProcessId='):
+                    current_pid = line.split('=', 1)[1].strip()
+                if 'remote-debugging-port' in line:
+                    m = re.search(r'--remote-debugging-port=(\d+)', line)
+                    if m:
+                        current_port = int(m.group(1))
+                if not line and current_port and current_pid:
+                    if current_port != LISTEN_PORT and current_port != 50325:
+                        port_pid[current_port] = current_pid
+                    current_port = 0
+                    current_pid = ''
+            if current_port and current_pid:
+                if current_port != LISTEN_PORT and current_port != 50325:
+                    port_pid[current_port] = current_pid
+            if port_pid:
+                break
+        except:
+            pass
+
+    # Method 2: Fallback to netstat scan
+    if not port_pid:
+        try:
+            output = subprocess.check_output(
+                'netstat -ano | findstr "LISTENING" | findstr "127.0.0.1"',
+                shell=True, timeout=5, stderr=subprocess.DEVNULL
+            ).decode('utf-8', errors='ignore')
+            for line in output.strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 5:
+                    addr = parts[1]
+                    pid = parts[4].strip()
+                    if ':' in addr:
+                        try:
+                            port = int(addr.split(':')[-1])
+                            if 10000 <= port <= 60000 and port != LISTEN_PORT and port != 50325:
+                                port_pid[port] = pid
+                        except:
+                            pass
+        except:
+            pass
+
     return port_pid
 
 
