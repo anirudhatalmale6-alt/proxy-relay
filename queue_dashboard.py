@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.6"
+VERSION = "4.7"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -673,56 +673,32 @@ class QueueDashboardApp:
                         return m.group(1)
         return ''
 
-    def _fetch_serials_bulk(self):
-        """Fetch all profiles from AdsPower API and match by user_id or name."""
-        all_users = []
-        for base in [API_BASE, 'http://local.adspower.net:50325']:
-            page = 1
-            while page <= 50:
-                r = http_get_json(f'{base}/api/v1/user/list?page={page}&page_size=100')
-                if not r or r.get('code') != 0:
-                    break
-                items = r.get('data', {}).get('list', [])
-                if not items:
-                    break
-                all_users.extend(items)
-                page += 1
-                time.sleep(0.3)
-            if all_users:
-                break
-
-        if not all_users:
+    def _fetch_serial_for_profile(self, profile):
+        """Look up a single profile's serial number by user_id via AdsPower API."""
+        if not profile.uid:
             return
+        for base in [API_BASE, 'http://local.adspower.net:50325']:
+            r = http_get_json(f'{base}/api/v1/user/list?user_id={profile.uid}')
+            if r and r.get('code') == 0:
+                items = r.get('data', {}).get('list', [])
+                if items:
+                    u = items[0]
+                    serial = str(u.get('serial_number', u.get('serialnumber', '')))
+                    name = str(u.get('name', ''))
+                    if serial:
+                        profile.serial = serial
+                        profile.ext_keys.add('s:' + serial)
+                    if name and not profile.name:
+                        profile.name = name
+                    return
 
-        uid_map = {}
-        name_map = {}
-        for u in all_users:
-            uid = str(u.get('user_id', ''))
-            serial = str(u.get('serial_number', u.get('serialnumber', '')))
-            name = str(u.get('name', ''))
-            info = {'serial': serial, 'name': name, 'uid': uid}
-            if uid:
-                uid_map[uid] = info
-            if name:
-                name_map[name.lower().strip()] = info
-
-        for key, profile in self.profiles.items():
+    def _fetch_serials_bulk(self):
+        """Look up serial numbers for all profiles that don't have one yet."""
+        for key, profile in list(self.profiles.items()):
             if profile.serial:
                 continue
-
-            info = None
-            if profile.uid and profile.uid in uid_map:
-                info = uid_map[profile.uid]
-            elif profile.name:
-                info = name_map.get(profile.name.lower().strip())
-
-            if info:
-                if info['serial']:
-                    profile.serial = info['serial']
-                    profile.ext_keys.add('s:' + info['serial'])
-                if info['uid'] and not profile.uid:
-                    profile.uid = info['uid']
-                    profile.ext_keys.add('u:' + info['uid'])
+            self._fetch_serial_for_profile(profile)
+            time.sleep(0.1)
 
     def _scan_profile_tabs(self, profile):
         """Scan a profile's tabs for TM queue pages. Returns False if port is dead."""
