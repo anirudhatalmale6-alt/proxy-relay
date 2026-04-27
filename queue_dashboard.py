@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.9"
+VERSION = "5.10"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -305,17 +305,22 @@ def get_uid_from_pid(pid):
 
 def check_debug_port(port):
     """Check if a port is a Chrome debug port by requesting /json."""
-    try:
-        req = urllib.request.Request(f'http://127.0.0.1:{port}/json/version', method='GET')
-        with urllib.request.urlopen(req, timeout=1) as resp:
-            data = json.loads(resp.read().decode())
-            browser = data.get('Browser', '').lower()
-            if any(b in browser for b in ['chrome', 'chromium', 'sunbrowser', 'adspower']):
-                return True
-            if data.get('webSocketDebuggerUrl'):
-                return True
-    except:
-        pass
+    for path in ['/json/version', '/json']:
+        try:
+            req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', method='GET')
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                raw = resp.read().decode()
+                data = json.loads(raw) if raw.strip().startswith('{') else None
+                if isinstance(data, dict):
+                    browser = data.get('Browser', '').lower()
+                    if any(b in browser for b in ['chrome', 'chromium', 'sunbrowser', 'adspower']):
+                        return True
+                    if data.get('webSocketDebuggerUrl'):
+                        return True
+                elif isinstance(json.loads(raw), list):
+                    return True
+        except:
+            pass
     return False
 
 
@@ -799,10 +804,15 @@ class QueueDashboardApp:
 
         results = []
         port_pid = find_chrome_debug_ports()
-        self.root.after(0, lambda c=len(port_pid): self._log(f'Found {c} candidate ports'))
+        ports_str = ', '.join(str(p) for p in sorted(port_pid.keys())[:10])
+        self.root.after(0, lambda c=len(port_pid), ps=ports_str:
+            self._log(f'Found {c} candidate ports: {ps}'))
 
         for port, pid in port_pid.items():
-            if check_debug_port(port):
+            is_chrome = check_debug_port(port)
+            if not is_chrome:
+                self.root.after(0, lambda p=port: self._log(f'Port {p}: not a Chrome debug port'))
+            if is_chrome:
                 uid = get_uid_from_pid(pid)
                 src = 'wmic'
                 if not uid:
