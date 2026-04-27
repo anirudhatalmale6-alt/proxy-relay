@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.0"
+VERSION = "4.1"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -884,133 +884,86 @@ class QueueDashboardApp:
             self._render_table()
 
     def _capture_screenshot(self):
-        """Capture only the table (header + rows) by hiding other UI and auto-sizing window."""
-        saved_geom = None
+        """Render the table data as a PNG image using Pillow."""
         try:
-            saved_geom = self.root.geometry()
+            from PIL import Image, ImageDraw, ImageFont
 
-            self.top_frame.pack_forget()
-            self.btn_frame.pack_forget()
-            self.log_frame.pack_forget()
+            rows_data = []
+            sorted_keys = sorted(self.profiles.keys(), key=lambda k: self.profiles[k].serial or '')
+            for key in sorted_keys:
+                p = self.profiles[key]
+                pid = str(p.serial) if p.serial else str(p.uid or key)
+                qnum = str(p.queue_num) if p.queue_num else '--'
+                link = p.tab_title or p.event or p.link or ''
+                rows_data.append((pid, qnum, link))
 
-            self.root.geometry('')
-            self.root.update_idletasks()
-            self.root.update()
-            time.sleep(0.3)
+            if not rows_data:
+                rows_data.append(('--', '--', '--'))
 
-            import ctypes
-            from ctypes import wintypes
+            col_widths = [100, 80, 380]
+            row_height = 28
+            header_height = 30
+            padding = 8
+            total_w = sum(col_widths) + padding * 2
+            total_h = header_height + row_height * len(rows_data) + padding
 
-            user32 = ctypes.windll.user32
-            gdi32 = ctypes.windll.gdi32
+            bg_color = (10, 10, 26)
+            header_bg = (22, 33, 62)
+            row_bg1 = (15, 15, 30)
+            row_bg2 = (20, 20, 38)
+            header_fg = (255, 215, 0)
+            text_fg = (200, 210, 230)
+            grid_color = (40, 40, 60)
 
-            user32.SetProcessDPIAware()
+            img = Image.new('RGB', (total_w, total_h), bg_color)
+            draw = ImageDraw.Draw(img)
 
-            hwnd = user32.FindWindowW(None, self.root.title())
-            if not hwnd:
-                hwnd = self.root.winfo_id()
+            try:
+                font = ImageFont.truetype('segoeui.ttf', 13)
+                font_bold = ImageFont.truetype('segoeuib.ttf', 13)
+            except:
+                try:
+                    font = ImageFont.truetype('arial.ttf', 13)
+                    font_bold = ImageFont.truetype('arialbd.ttf', 13)
+                except:
+                    font = ImageFont.load_default()
+                    font_bold = font
 
-            rect = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
+            headers = ['Profile ID', 'Queue #', 'Link']
+            draw.rectangle([0, 0, total_w, header_height], fill=header_bg)
+            x = padding
+            for i, hdr in enumerate(headers):
+                draw.text((x + 4, 7), hdr, fill=header_fg, font=font_bold)
+                x += col_widths[i]
 
-            self._log(f'Screenshot capture: {w}x{h}')
+            draw.line([(0, header_height), (total_w, header_height)], fill=grid_color)
 
-            if w <= 0 or h <= 0:
-                self._restore_ui(saved_geom)
-                return None
+            for row_idx, (pid, qnum, link) in enumerate(rows_data):
+                y = header_height + row_idx * row_height
+                bg = row_bg1 if row_idx % 2 == 0 else row_bg2
+                draw.rectangle([0, y, total_w, y + row_height], fill=bg)
 
-            hdc_screen = user32.GetDC(0)
-            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
-            gdi32.SelectObject(hdc_mem, hbmp)
+                x = padding
+                vals = [pid, qnum, link]
+                for col_idx, val in enumerate(vals):
+                    max_chars = col_widths[col_idx] // 7
+                    if len(val) > max_chars:
+                        val = val[:max_chars - 2] + '..'
+                    draw.text((x + 4, y + 6), val, fill=text_fg, font=font)
+                    x += col_widths[col_idx]
 
-            PW_RENDERFULLCONTENT = 2
-            result = user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT)
-            if not result:
-                SRCCOPY = 0x00CC0020
-                gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, rect.left, rect.top, SRCCOPY)
+                draw.line([(0, y + row_height - 1), (total_w, y + row_height - 1)], fill=grid_color)
 
-            class BITMAPINFOHEADER(ctypes.Structure):
-                _fields_ = [
-                    ('biSize', wintypes.DWORD), ('biWidth', ctypes.c_long),
-                    ('biHeight', ctypes.c_long), ('biPlanes', wintypes.WORD),
-                    ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD),
-                    ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', ctypes.c_long),
-                    ('biYPelsPerMeter', ctypes.c_long), ('biClrUsed', wintypes.DWORD),
-                    ('biClrImportant', wintypes.DWORD),
-                ]
-
-            bi = BITMAPINFOHEADER()
-            bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bi.biWidth = w
-            bi.biHeight = -h
-            bi.biPlanes = 1
-            bi.biBitCount = 24
-            bi.biCompression = 0
-
-            row_size = ((w * 3 + 3) // 4) * 4
-            img_size = row_size * h
-            buf = ctypes.create_string_buffer(img_size)
-
-            gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
-
-            gdi32.DeleteObject(hbmp)
-            gdi32.DeleteDC(hdc_mem)
-            user32.ReleaseDC(0, hdc_screen)
-
-            self._restore_ui(saved_geom)
-
-            import struct, io, zlib
-            raw_rows = []
-            for y in range(h):
-                row_data = bytearray(w * 3)
-                for x in range(w):
-                    offset = y * row_size + x * 3
-                    b, g, r = buf[offset], buf[offset + 1], buf[offset + 2]
-                    row_data[x * 3] = ord(r) if isinstance(r, str) else r
-                    row_data[x * 3 + 1] = ord(g) if isinstance(g, str) else g
-                    row_data[x * 3 + 2] = ord(b) if isinstance(b, str) else b
-                raw_rows.append(b'\x00' + bytes(row_data))
-
-            raw = b''.join(raw_rows)
-            compressed = zlib.compress(raw)
-
-            png = io.BytesIO()
-            png.write(b'\x89PNG\r\n\x1a\n')
-
-            def write_chunk(chunk_type, data):
-                png.write(struct.pack('>I', len(data)))
-                png.write(chunk_type)
-                png.write(data)
-                crc = zlib.crc32(chunk_type + data) & 0xffffffff
-                png.write(struct.pack('>I', crc))
-
-            ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
-            write_chunk(b'IHDR', ihdr)
-            write_chunk(b'IDAT', compressed)
-            write_chunk(b'IEND', b'')
-
-            return png.getvalue()
+            import io
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            self._log(f'Screenshot rendered: {len(rows_data)} rows, {total_w}x{total_h}px')
+            return buf.getvalue()
         except Exception as e:
-            self._restore_ui(saved_geom)
             self._log(f'Screenshot failed: {e}')
             import traceback
             traceback.print_exc()
             return None
-
-    def _restore_ui(self, saved_geom=None):
-        """Restore all UI elements after screenshot capture."""
-        try:
-            self.top_frame.pack(fill='x', padx=10, pady=(10, 3), before=self.header_frame)
-            self.btn_frame.pack(fill='x', padx=10, pady=3, after=self.top_frame)
-            self.log_frame.pack(fill='x', padx=10, pady=(3, 10))
-            if saved_geom:
-                self.root.geometry(saved_geom)
-            self.root.update_idletasks()
-        except:
-            pass
 
     def _send_discord(self):
         name = self.discord_name_entry.get().strip()
@@ -1058,12 +1011,12 @@ class QueueDashboardApp:
                     data = body.getvalue()
                     req = urllib.request.Request(webhook, data=data, method='POST')
                     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-                    req.add_header('User-Agent', 'QueueDashboard/4.0')
+                    req.add_header('User-Agent', 'QueueDashboard/4.1')
                 else:
                     data = json.dumps({'username': f'{name} | Queue Dashboard', 'content': content}).encode()
                     req = urllib.request.Request(webhook, data=data, method='POST')
                     req.add_header('Content-Type', 'application/json')
-                    req.add_header('User-Agent', 'QueueDashboard/4.0')
+                    req.add_header('User-Agent', 'QueueDashboard/4.1')
 
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     if resp.status < 300:

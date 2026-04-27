@@ -16,8 +16,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Install dependencies
+        run: pip install pyinstaller Pillow
 
       - name: Build ProxyRelay EXE
         run: pyinstaller --onefile --windowed --name ProxyRelay proxy_relay.py
