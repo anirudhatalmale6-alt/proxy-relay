@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.8"
+VERSION = "3.9"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -431,12 +431,12 @@ class QueueDashboardApp:
                   fg='#fff', bg='#5865F2', border=0, padx=8, pady=2,
                   cursor='hand2', command=self._send_discord).pack(side='left', padx=2)
 
-        header_frame = tk.Frame(self.root, bg='#16213e')
-        header_frame.pack(fill='x', padx=10, pady=(8, 0))
+        self.header_frame = tk.Frame(self.root, bg='#16213e')
+        self.header_frame.pack(fill='x', padx=10, pady=(8, 0))
 
         cols = [('Profile ID', 120), ('Queue #', 80), ('Link', 350), ('', 40)]
         for text, w in cols:
-            tk.Label(header_frame, text=text, font=('Segoe UI', 9, 'bold'),
+            tk.Label(self.header_frame, text=text, font=('Segoe UI', 9, 'bold'),
                      fg='#FFD700', bg='#16213e', width=w // 7, anchor='w').pack(side='left', padx=1)
 
         table_container = tk.Frame(self.root, bg='#1a1a2e')
@@ -880,7 +880,7 @@ class QueueDashboardApp:
             self._render_table()
 
     def _capture_screenshot(self):
-        """Capture the dashboard window as BMP bytes using Win32 API."""
+        """Capture only the table area (header + rows) as PNG using Win32 API."""
         try:
             import ctypes
             from ctypes import wintypes
@@ -892,20 +892,20 @@ class QueueDashboardApp:
 
             rect = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
+            win_w = rect.right - rect.left
+            win_h = rect.bottom - rect.top
 
-            if w <= 0 or h <= 0:
+            if win_w <= 0 or win_h <= 0:
                 return None
 
             hdc_screen = user32.GetDC(0)
             hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, win_w, win_h)
             gdi32.SelectObject(hdc_mem, hbmp)
 
             result = user32.PrintWindow(hwnd, hdc_mem, 2)
             if not result:
-                gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, rect.left, rect.top, 0x00CC0020)
+                gdi32.BitBlt(hdc_mem, 0, 0, win_w, win_h, hdc_screen, rect.left, rect.top, 0x00CC0020)
 
             class BITMAPINFOHEADER(ctypes.Structure):
                 _fields_ = [
@@ -919,21 +919,44 @@ class QueueDashboardApp:
 
             bi = BITMAPINFOHEADER()
             bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bi.biWidth = w
-            bi.biHeight = -h
+            bi.biWidth = win_w
+            bi.biHeight = -win_h
             bi.biPlanes = 1
             bi.biBitCount = 24
             bi.biCompression = 0
 
-            row_size = ((w * 3 + 3) // 4) * 4
-            img_size = row_size * h
+            row_size = ((win_w * 3 + 3) // 4) * 4
+            img_size = row_size * win_h
             buf = ctypes.create_string_buffer(img_size)
 
-            gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
+            gdi32.GetDIBits(hdc_mem, hbmp, 0, win_h, buf, ctypes.byref(bi), 0)
+
+            gdi32.DeleteObject(hbmp)
+            gdi32.DeleteDC(hdc_mem)
+            user32.ReleaseDC(0, hdc_screen)
+
+            # Crop to just the table area (header + table rows)
+            try:
+                win_y = rect.top
+                hdr_y = self.header_frame.winfo_rooty() - win_y
+                tbl_y = self.table_canvas.winfo_rooty() - win_y
+                tbl_h = self.table_canvas.winfo_height()
+                crop_top = max(0, hdr_y)
+                crop_bottom = min(win_h, tbl_y + tbl_h)
+            except:
+                crop_top = 0
+                crop_bottom = win_h
+
+            if crop_bottom <= crop_top:
+                crop_top = 0
+                crop_bottom = win_h
+
+            w = win_w
+            h = crop_bottom - crop_top
 
             import struct, io, zlib
             raw_rows = []
-            for y in range(h):
+            for y in range(crop_top, crop_bottom):
                 row_data = bytearray(w * 3)
                 for x in range(w):
                     offset = y * row_size + x * 3
@@ -961,10 +984,6 @@ class QueueDashboardApp:
             write_chunk(b'IDAT', compressed)
             write_chunk(b'IEND', b'')
 
-            gdi32.DeleteObject(hbmp)
-            gdi32.DeleteDC(hdc_mem)
-            user32.ReleaseDC(0, hdc_screen)
-
             return png.getvalue()
         except Exception as e:
             self._log(f'Screenshot failed: {e}')
@@ -991,30 +1010,7 @@ class QueueDashboardApp:
 
         def do_send():
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
-
-            sorted_p = sorted(self.profiles.values(),
-                               key=lambda p: (-(p.queue_num or 999999), p.serial or ''))
-
-            lines = [f'**Queue Dashboard** | {name} | {ts}']
-            in_queue = sum(1 for p in sorted_p if p.queue_num and p.queue_num > 0)
-            lines.append(f'{len(sorted_p)} profiles | {in_queue} in queue')
-
-            if in_queue > 0:
-                lines.append('```')
-                lines.append(f'{"Profile ID":<16} {"Queue #":<10} {"Link":<40}')
-                lines.append('-' * 66)
-                for p in sorted_p:
-                    if p.queue_num and p.queue_num > 0:
-                        pid = p.serial or p.name or str(p.debug_port)
-                        link_text = p.tab_title or p.event or ''
-                        if link_text:
-                            link_text = re.sub(r'\s*[|\-–—]\s*(?:ticketmaster|livenation).*$', '', link_text, flags=re.IGNORECASE).strip()
-                        if not link_text and p.link:
-                            link_text = p.link.split('?')[0][-40:]
-                        lines.append(f'{pid:<16} {str(p.queue_num):<10} {(link_text or "--")[:40]:<40}')
-                lines.append('```')
-
-            content = '\n'.join(lines)
+            content = ts
 
             try:
                 if screenshot_data:
