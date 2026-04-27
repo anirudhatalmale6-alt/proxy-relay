@@ -1,7 +1,8 @@
 """
-AdsPower Queue Dashboard v3.1
+AdsPower Queue Dashboard v5.5
 Scans for Chrome debug ports, evaluates queue JS via CDP.
-Discord screenshot, fast 4s scans, bulk serial fetch.
+Profile map cache: fetches ALL profiles from AdsPower API on startup,
+builds uid/email/name -> Custom# mapping, cached to profile_map.json.
 """
 
 import tkinter as tk
@@ -12,6 +13,8 @@ import time
 import re
 import socket
 import subprocess
+import os
+import sys
 
 try:
     import urllib.request
@@ -22,11 +25,12 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.4"
+VERSION = "5.5"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
 FULL_SCAN_INTERVAL = 30
+PROFILE_MAP_REFRESH = 300
 
 _app_ref = None
 
@@ -401,11 +405,16 @@ class QueueDashboardApp:
         self.last_full_scan = 0
         self.user_list_cache = {}
         self._last_dom_profiles = []
+        self._profile_map = {}
+        self._profile_map_time = 0
         self._build_ui()
+        self._load_profile_map()
         self._start_server()
         self._check_connection_loop()
         self.root.after(100, self._force_scan)
         self.root.after(SCAN_INTERVAL * 1000, self._scan_loop)
+        self.root.after(3000, lambda: threading.Thread(
+            target=self._build_profile_map, daemon=True).start())
 
     def _log(self, msg):
         ts = time.strftime('%H:%M:%S')
@@ -745,11 +754,17 @@ class QueueDashboardApp:
 
             missing = [p for p in self.profiles.values() if not p.serial]
             for p in missing:
+                self._lookup_serial_from_map(p)
+                if p.serial:
+                    continue
                 if p.uid:
                     self._fetch_serial_for_profile(p, log=True)
                 if not p.serial and p.name:
                     self._fetch_serial_by_email(p)
                 time.sleep(0.1)
+
+            if time.time() - self._profile_map_time > PROFILE_MAP_REFRESH:
+                self._build_profile_map()
 
             self.root.after(0, self._apply_dom_serials)
             self.root.after(0, self._update_status_bar)
@@ -869,9 +884,126 @@ class QueueDashboardApp:
                                 self._log(f'API: {e} → Custom #{s}'))
                             return
 
+    def _get_profile_map_path(self):
+        try:
+            if getattr(sys, 'frozen', False):
+                base = os.path.dirname(sys.executable)
+            else:
+                base = os.path.dirname(os.path.abspath(__file__))
+            return os.path.join(base, 'profile_map.json')
+        except:
+            return 'profile_map.json'
+
+    def _load_profile_map(self):
+        try:
+            path = self._get_profile_map_path()
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    self._profile_map = json.load(f)
+                self._profile_map_time = self._profile_map.get('_updated', 0)
+                count = len([k for k in self._profile_map if not k.startswith('_')])
+                self._log(f'Loaded profile map: {count} entries from cache')
+        except Exception as e:
+            self._log(f'Could not load profile map: {e}')
+
+    def _save_profile_map(self):
+        try:
+            path = self._get_profile_map_path()
+            self._profile_map['_updated'] = time.time()
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(self._profile_map, f, indent=2)
+        except:
+            pass
+
+    def _build_profile_map(self):
+        self.root.after(0, lambda: self._log('Building profile map from AdsPower API...'))
+        new_map = {}
+
+        for base in [API_BASE, 'http://local.adspower.net:50325']:
+            page = 1
+            found_any = False
+            while page <= 50:
+                r = http_get_json(
+                    f'{base}/api/v1/user/list?page={page}&page_size=100',
+                    timeout=10)
+                if not r or r.get('code') != 0:
+                    break
+                items = r.get('data', {}).get('list', [])
+                if not items:
+                    break
+                found_any = True
+                for u in items:
+                    uid = str(u.get('user_id', '')).strip()
+                    serial = str(
+                        u.get('serial_number', '')
+                        or u.get('serialnumber', '')
+                        or u.get('custom_user_id', '')
+                    ).strip()
+                    name = str(u.get('name', '')).strip()
+                    if not serial:
+                        continue
+                    if uid:
+                        new_map[f'uid:{uid}'] = serial
+                    email = self._extract_email(name)
+                    if email:
+                        new_map[f'email:{email}'] = serial
+                    if name:
+                        new_map[f'name:{name.lower().strip()}'] = serial
+                if len(items) < 100:
+                    break
+                page += 1
+                time.sleep(0.3)
+
+            if found_any:
+                break
+
+        if new_map:
+            for k, v in new_map.items():
+                self._profile_map[k] = v
+            self._profile_map_time = time.time()
+            self._save_profile_map()
+            count = len([k for k in self._profile_map if not k.startswith('_')])
+            self.root.after(0, lambda c=count:
+                self._log(f'Profile map built: {c} entries'))
+        else:
+            self.root.after(0, lambda:
+                self._log('Profile map: no profiles found from API'))
+
+    def _lookup_serial_from_map(self, profile):
+        if not self._profile_map:
+            return
+        if profile.uid:
+            serial = self._profile_map.get(f'uid:{profile.uid}')
+            if serial:
+                profile.serial = serial
+                profile.ext_keys.add('s:' + serial)
+                self.root.after(0, lambda s=serial, u=profile.uid:
+                    self._log(f'Map: uid={u} -> #{s}'))
+                return
+        email = self._extract_email(profile.name)
+        if email:
+            serial = self._profile_map.get(f'email:{email}')
+            if serial:
+                profile.serial = serial
+                profile.ext_keys.add('s:' + serial)
+                self.root.after(0, lambda s=serial, e=email:
+                    self._log(f'Map: {e} -> #{s}'))
+                return
+        if profile.name:
+            serial = self._profile_map.get(f'name:{profile.name.lower().strip()}')
+            if serial:
+                profile.serial = serial
+                profile.ext_keys.add('s:' + serial)
+                self.root.after(0, lambda s=serial, n=profile.name:
+                    self._log(f'Map: {n} -> #{s}'))
+                return
+
     def _fetch_serials_bulk(self):
         """Look up serial numbers for all profiles that don't have one yet."""
         for key, profile in list(self.profiles.items()):
+            if profile.serial:
+                continue
+            self._lookup_serial_from_map(profile)
             if profile.serial:
                 continue
             self._fetch_serial_for_profile(profile)
