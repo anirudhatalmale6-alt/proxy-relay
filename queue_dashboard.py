@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.2"
+VERSION = "5.3"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -524,34 +524,86 @@ class QueueDashboardApp:
             self.conn_indicator.configure(fg='#ff4444')
         self.root.after(5000, self._check_connection_loop)
 
+    @staticmethod
+    def _extract_email(text):
+        if not text:
+            return ''
+        text = text.lower().strip()
+        m = re.search(r'[\w.+\-]+@[\w.\-]+\.\w{2,}', text)
+        return m.group(0) if m else ''
+
     def _apply_dom_serials(self):
-        """Match DOM-scraped Custom # to profiles by email address."""
+        """Use DOM profiles as the source of truth for Custom #.
+
+        When the extension pushes domProfiles from the Running tab,
+        we rebuild self.profiles from that data so serials always match
+        the dashboard exactly.
+        """
         if not self._last_dom_profiles:
             return
-        name_serial = {}
+
+        email_to_profile = {}
+        uid_to_profile = {}
+        for key, p in self.profiles.items():
+            email = self._extract_email(p.name)
+            if email:
+                email_to_profile[email] = p
+            if p.uid:
+                uid_to_profile[p.uid] = p
+
+        new_profiles = {}
         for dp in self._last_dom_profiles:
-            serial = str(dp.get('serial', ''))
+            serial = str(dp.get('serial', '')).strip()
             name = str(dp.get('name', '')).lower().strip()
-            if serial and name:
-                name_serial[name] = serial
-        if not name_serial:
-            return
-        matched = 0
-        for key, profile in self.profiles.items():
-            if profile.serial:
+            user_id = str(dp.get('userId', '')).strip()
+            if not serial:
                 continue
-            pname = (profile.name or '').lower().strip()
-            em = re.search(r'[\w.+\-]+@[\w.\-]+\.\w{2,}', pname)
-            if em:
-                pname = em.group(0)
-            if not pname or len(pname) < 5:
-                continue
-            if pname in name_serial:
-                profile.serial = name_serial[pname]
-                profile.ext_keys.add('s:' + profile.serial)
-                matched += 1
-        if matched:
-            self._log(f'Matched {matched} Custom # from dashboard')
+
+            key = 's:' + serial
+
+            old = None
+            if user_id:
+                old = uid_to_profile.get(user_id)
+            if not old and name and len(name) >= 5:
+                old = email_to_profile.get(name)
+
+            if key in self.profiles:
+                p = self.profiles[key]
+                if name and not p.name:
+                    p.name = name
+                if old and old is not p:
+                    if old.debug_port and not p.debug_port:
+                        p.debug_port = old.debug_port
+                    if old.uid and not p.uid:
+                        p.uid = old.uid
+                        p.ext_keys.add('u:' + p.uid)
+                if user_id and not p.uid:
+                    p.uid = user_id
+                    p.ext_keys.add('u:' + user_id)
+                new_profiles[key] = p
+            else:
+                port = old.debug_port if old else 0
+                uid = user_id or (old.uid if old else '')
+                p = ProfileRow(port, name, serial, uid)
+                p.ext_keys.add('s:' + serial)
+                if uid:
+                    p.ext_keys.add('u:' + uid)
+                if old:
+                    p.queue_num = old.queue_num
+                    p.event = old.event
+                    p.link = old.link
+                    p.link_from_cdp = old.link_from_cdp
+                    p.tab_title = old.tab_title
+                    if old.status not in ('', 'Scanning...'):
+                        p.status = old.status
+                    p.last_update = old.last_update
+                new_profiles[key] = p
+
+        if new_profiles:
+            changed = set(new_profiles.keys()) != set(self.profiles.keys())
+            self.profiles = new_profiles
+            if changed:
+                self._log(f'Dashboard: {len(new_profiles)} profiles active')
             self._render_table()
 
     def _handle_push(self, data):
@@ -676,7 +728,8 @@ class QueueDashboardApp:
                         if port and not p.debug_port:
                             p.debug_port = port
 
-                stale = [k for k in self.profiles if k not in active_keys]
+                stale = [k for k in self.profiles
+                         if k not in active_keys and not k.startswith('s:')]
                 for k in stale:
                     del self.profiles[k]
 
@@ -699,10 +752,15 @@ class QueueDashboardApp:
                 time.sleep(0.15)
 
             for k in dead_keys:
-                p = self.profiles.pop(k, None)
+                p = self.profiles.get(k)
                 if p:
-                    self.root.after(0, lambda pp=p: self._log(
-                        f'Profile closed: #{pp.serial}'))
+                    if k.startswith('s:'):
+                        p.debug_port = 0
+                        p.status = 'Running'
+                    else:
+                        del self.profiles[k]
+                        self.root.after(0, lambda pp=p: self._log(
+                            f'Profile closed: #{pp.serial}'))
 
             self.root.after(0, self._apply_dom_serials)
             self.root.after(0, self._update_status_bar)
