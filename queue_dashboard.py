@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.10"
+VERSION = "5.11"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -241,7 +241,7 @@ def find_chrome_debug_ports():
     port_pid = {}
     try:
         output = subprocess.check_output(
-            'netstat -ano | findstr "LISTENING" | findstr "127.0.0.1"',
+            'netstat -ano | findstr "LISTENING"',
             shell=True, timeout=5, stderr=subprocess.DEVNULL
         ).decode('utf-8', errors='ignore')
         for line in output.strip().split('\n'):
@@ -303,24 +303,30 @@ def get_uid_from_pid(pid):
     return ''
 
 
-def check_debug_port(port):
+def check_debug_port(port, log_func=None):
     """Check if a port is a Chrome debug port by requesting /json."""
-    for path in ['/json/version', '/json']:
+    for path in ['/json', '/json/version']:
+        url = f'http://127.0.0.1:{port}{path}'
         try:
-            req = urllib.request.Request(f'http://127.0.0.1:{port}{path}', method='GET')
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 raw = resp.read().decode()
-                data = json.loads(raw) if raw.strip().startswith('{') else None
-                if isinstance(data, dict):
-                    browser = data.get('Browser', '').lower()
-                    if any(b in browser for b in ['chrome', 'chromium', 'sunbrowser', 'adspower']):
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, (list, dict)):
                         return True
-                    if data.get('webSocketDebuggerUrl'):
-                        return True
-                elif isinstance(json.loads(raw), list):
-                    return True
-        except:
-            pass
+                except:
+                    if log_func:
+                        log_func(f'Port {port}: response not JSON ({raw[:80]})')
+        except urllib.error.URLError as e:
+            if log_func:
+                log_func(f'Port {port}: {e.reason}')
+        except socket.timeout:
+            if log_func:
+                log_func(f'Port {port}: timeout (5s)')
+        except Exception as e:
+            if log_func:
+                log_func(f'Port {port}: {type(e).__name__}')
     return False
 
 
@@ -808,10 +814,11 @@ class QueueDashboardApp:
         self.root.after(0, lambda c=len(port_pid), ps=ports_str:
             self._log(f'Found {c} candidate ports: {ps}'))
 
+        def _log_port(msg):
+            self.root.after(0, lambda m=msg: self._log(m))
+
         for port, pid in port_pid.items():
-            is_chrome = check_debug_port(port)
-            if not is_chrome:
-                self.root.after(0, lambda p=port: self._log(f'Port {p}: not a Chrome debug port'))
+            is_chrome = check_debug_port(port, log_func=_log_port)
             if is_chrome:
                 uid = get_uid_from_pid(pid)
                 src = 'wmic'
