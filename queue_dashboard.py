@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.3"
+VERSION = "5.3.1"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -255,27 +255,45 @@ def find_chrome_debug_ports():
     return port_pid
 
 
+_UID_EXCLUDE = frozenset((
+    'default', 'appdata', 'roaming', 'local', 'google', 'chrome',
+    'chromium', 'sunbrowser', 'adspower', 'adsrower', 'program',
+    'windows', 'global', 'cache', 'system32', 'profiles',
+))
+
+_UID_PATTERNS = [
+    re.compile(r'[/\\]([a-z][a-z0-9]{6,})[/\\](?:Default|Cache|Preferences)', re.IGNORECASE),
+    re.compile(r'user-data-dir[=\\/"\']+[^"]*?[/\\]([a-z][a-z0-9]{6,})', re.IGNORECASE),
+    re.compile(r'(?:adspower|AdsRower|SunBrowser)[^"]*?[/\\]([a-z][a-z0-9]{6,})', re.IGNORECASE),
+    re.compile(r'profile-directory[=\\/"\']+([a-z][a-z0-9]{6,})', re.IGNORECASE),
+]
+
+
+def _extract_uid_from_cmdline(cmdline):
+    for pattern in _UID_PATTERNS:
+        m = pattern.search(cmdline)
+        if m:
+            uid = m.group(1).lower()
+            if uid not in _UID_EXCLUDE:
+                return uid
+    return ''
+
+
 def get_uid_from_pid(pid):
     """Extract AdsPower user_id from Chrome process command line."""
-    try:
-        output = subprocess.check_output(
-            f'wmic process where "processid={pid}" get commandline /format:list',
-            shell=True, timeout=5, stderr=subprocess.DEVNULL
-        ).decode('utf-8', errors='ignore')
-        for pattern in [
-            r'[/\\]([a-z][a-z0-9]{6,})[/\\](?:Default|Cache|Preferences)',
-            r'user-data-dir[=\\/"\']+[^"]*?[/\\]([a-z][a-z0-9]{6,})',
-            r'(?:adspower|AdsRower|SunBrowser)[^"]*?[/\\]([a-z][a-z0-9]{6,})',
-            r'profile-directory[=\\/"\']+([a-z][a-z0-9]{6,})',
-        ]:
-            m = re.search(pattern, output, re.IGNORECASE)
-            if m:
-                uid = m.group(1).lower()
-                if uid not in ('default', 'appdata', 'roaming', 'local', 'google', 'chrome',
-                               'chromium', 'sunbrowser', 'adspower', 'adsrower', 'program', 'windows'):
-                    return uid
-    except:
-        pass
+    for cmd in [
+        f'wmic process where "processid={pid}" get commandline /format:list',
+        f'powershell -Command "(Get-CimInstance Win32_Process -Filter \'ProcessId={pid}\').CommandLine"',
+    ]:
+        try:
+            output = subprocess.check_output(
+                cmd, shell=True, timeout=5, stderr=subprocess.DEVNULL
+            ).decode('utf-8', errors='ignore')
+            uid = _extract_uid_from_cmdline(output)
+            if uid:
+                return uid
+        except:
+            pass
     return ''
 
 
@@ -533,77 +551,45 @@ class QueueDashboardApp:
         return m.group(0) if m else ''
 
     def _apply_dom_serials(self):
-        """Use DOM profiles as the source of truth for Custom #.
-
-        When the extension pushes domProfiles from the Running tab,
-        we rebuild self.profiles from that data so serials always match
-        the dashboard exactly.
-        """
+        """Match DOM-scraped Custom # to profiles by userId or email."""
         if not self._last_dom_profiles:
             return
 
-        email_to_profile = {}
-        uid_to_profile = {}
-        for key, p in self.profiles.items():
-            email = self._extract_email(p.name)
-            if email:
-                email_to_profile[email] = p
-            if p.uid:
-                uid_to_profile[p.uid] = p
-
-        new_profiles = {}
+        uid_serial = {}
+        name_serial = {}
         for dp in self._last_dom_profiles:
             serial = str(dp.get('serial', '')).strip()
             name = str(dp.get('name', '')).lower().strip()
             user_id = str(dp.get('userId', '')).strip()
             if not serial:
                 continue
-
-            key = 's:' + serial
-
-            old = None
             if user_id:
-                old = uid_to_profile.get(user_id)
-            if not old and name and len(name) >= 5:
-                old = email_to_profile.get(name)
+                uid_serial[user_id] = serial
+            if name and len(name) >= 5:
+                name_serial[name] = serial
 
-            if key in self.profiles:
-                p = self.profiles[key]
-                if name and not p.name:
-                    p.name = name
-                if old and old is not p:
-                    if old.debug_port and not p.debug_port:
-                        p.debug_port = old.debug_port
-                    if old.uid and not p.uid:
-                        p.uid = old.uid
-                        p.ext_keys.add('u:' + p.uid)
-                if user_id and not p.uid:
-                    p.uid = user_id
-                    p.ext_keys.add('u:' + user_id)
-                new_profiles[key] = p
-            else:
-                port = old.debug_port if old else 0
-                uid = user_id or (old.uid if old else '')
-                p = ProfileRow(port, name, serial, uid)
-                p.ext_keys.add('s:' + serial)
-                if uid:
-                    p.ext_keys.add('u:' + uid)
-                if old:
-                    p.queue_num = old.queue_num
-                    p.event = old.event
-                    p.link = old.link
-                    p.link_from_cdp = old.link_from_cdp
-                    p.tab_title = old.tab_title
-                    if old.status not in ('', 'Scanning...'):
-                        p.status = old.status
-                    p.last_update = old.last_update
-                new_profiles[key] = p
+        if not uid_serial and not name_serial:
+            return
 
-        if new_profiles:
-            changed = set(new_profiles.keys()) != set(self.profiles.keys())
-            self.profiles = new_profiles
-            if changed:
-                self._log(f'Dashboard: {len(new_profiles)} profiles active')
+        matched = 0
+        for key, profile in self.profiles.items():
+            if profile.serial:
+                continue
+
+            if profile.uid and profile.uid in uid_serial:
+                profile.serial = uid_serial[profile.uid]
+                profile.ext_keys.add('s:' + profile.serial)
+                matched += 1
+                continue
+
+            pname = self._extract_email(profile.name)
+            if pname and pname in name_serial:
+                profile.serial = name_serial[pname]
+                profile.ext_keys.add('s:' + profile.serial)
+                matched += 1
+
+        if matched:
+            self._log(f'Matched {matched} Custom # from dashboard')
             self._render_table()
 
     def _handle_push(self, data):
@@ -728,8 +714,7 @@ class QueueDashboardApp:
                         if port and not p.debug_port:
                             p.debug_port = port
 
-                stale = [k for k in self.profiles
-                         if k not in active_keys and not k.startswith('s:')]
+                stale = [k for k in self.profiles if k not in active_keys]
                 for k in stale:
                     del self.profiles[k]
 
@@ -752,15 +737,16 @@ class QueueDashboardApp:
                 time.sleep(0.15)
 
             for k in dead_keys:
-                p = self.profiles.get(k)
+                p = self.profiles.pop(k, None)
                 if p:
-                    if k.startswith('s:'):
-                        p.debug_port = 0
-                        p.status = 'Running'
-                    else:
-                        del self.profiles[k]
-                        self.root.after(0, lambda pp=p: self._log(
-                            f'Profile closed: #{pp.serial}'))
+                    self.root.after(0, lambda pp=p: self._log(
+                        f'Profile closed: #{pp.serial}'))
+
+            missing = [p for p in self.profiles.values()
+                       if not p.serial and p.uid]
+            for p in missing:
+                self._fetch_serial_for_profile(p, log=True)
+                time.sleep(0.1)
 
             self.root.after(0, self._apply_dom_serials)
             self.root.after(0, self._update_status_bar)
@@ -819,24 +805,35 @@ class QueueDashboardApp:
                 return m.group(1)
         return ''
 
-    def _fetch_serial_for_profile(self, profile):
+    def _fetch_serial_for_profile(self, profile, log=False):
         """Look up a single profile's serial number by user_id via AdsPower API."""
         if not profile.uid:
             return
         for base in [API_BASE, 'http://local.adspower.net:50325']:
-            r = http_get_json(f'{base}/api/v1/user/list?user_id={profile.uid}')
+            r = http_get_json(f'{base}/api/v1/user/list?user_id={profile.uid}', timeout=5)
             if r and r.get('code') == 0:
                 items = r.get('data', {}).get('list', [])
                 if items:
                     u = items[0]
-                    serial = str(u.get('serial_number', u.get('serialnumber', '')))
+                    serial = str(
+                        u.get('serial_number', '')
+                        or u.get('serialnumber', '')
+                        or u.get('custom_user_id', '')
+                    )
                     name = str(u.get('name', ''))
                     if serial:
                         profile.serial = serial
                         profile.ext_keys.add('s:' + serial)
+                        if log:
+                            self.root.after(0, lambda s=serial, uid=profile.uid:
+                                self._log(f'API: uid={uid} → Custom #{s}'))
                     if name and not profile.name:
                         profile.name = name
                     return
+            elif log:
+                msg = str(r.get('msg', 'no response')) if r else 'timeout'
+                self.root.after(0, lambda uid=profile.uid, m=msg:
+                    self._log(f'API lookup failed for {uid}: {m}'))
 
     def _fetch_serials_bulk(self):
         """Look up serial numbers for all profiles that don't have one yet."""
@@ -872,6 +869,16 @@ class QueueDashboardApp:
         if not page_tabs:
             profile.status = 'No tabs'
             return True
+
+        if not profile.uid:
+            for tab in page_tabs:
+                url = tab.get('url', '')
+                if 'start.adspower' in url or 'adspower' in url:
+                    m = re.search(r'[?&]id=([a-z][a-z0-9]{6,})', url)
+                    if m:
+                        profile.uid = m.group(1)
+                        profile.ext_keys.add('u:' + profile.uid)
+                        break
 
         if not profile.name:
             for tab in page_tabs:
