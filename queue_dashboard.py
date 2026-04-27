@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.9"
+VERSION = "4.0"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -371,7 +371,8 @@ class QueueDashboardApp:
         self.log_text.configure(state='disabled')
 
     def _build_ui(self):
-        top = tk.Frame(self.root, bg='#1a1a2e')
+        self.top_frame = tk.Frame(self.root, bg='#1a1a2e')
+        top = self.top_frame
         top.pack(fill='x', padx=10, pady=(10, 3))
 
         tk.Label(top, text='QUEUE DASHBOARD',
@@ -389,7 +390,8 @@ class QueueDashboardApp:
                                         fg='#ff4444', bg='#1a1a2e')
         self.conn_indicator.pack(side='right', padx=(0, 8))
 
-        btn_frame = tk.Frame(self.root, bg='#1a1a2e')
+        self.btn_frame = tk.Frame(self.root, bg='#1a1a2e')
+        btn_frame = self.btn_frame
         btn_frame.pack(fill='x', padx=10, pady=3)
 
         tk.Button(btn_frame, text='Refresh All Tabs', font=('Segoe UI', 9, 'bold'),
@@ -439,7 +441,8 @@ class QueueDashboardApp:
             tk.Label(self.header_frame, text=text, font=('Segoe UI', 9, 'bold'),
                      fg='#FFD700', bg='#16213e', width=w // 7, anchor='w').pack(side='left', padx=1)
 
-        table_container = tk.Frame(self.root, bg='#1a1a2e')
+        self.table_container = tk.Frame(self.root, bg='#1a1a2e')
+        table_container = self.table_container
         table_container.pack(fill='both', expand=True, padx=10, pady=2)
 
         self.table_canvas = tk.Canvas(table_container, bg='#0a0a1a', highlightthickness=0)
@@ -457,7 +460,8 @@ class QueueDashboardApp:
         self.table_canvas.bind_all('<MouseWheel>',
                                     lambda e: self.table_canvas.yview_scroll(-1 * (e.delta // 120), 'units'))
 
-        log_frame = tk.Frame(self.root, bg='#1a1a2e')
+        self.log_frame = tk.Frame(self.root, bg='#1a1a2e')
+        log_frame = self.log_frame
         log_frame.pack(fill='x', padx=10, pady=(3, 10))
         tk.Label(log_frame, text='Log', font=('Segoe UI', 8), fg='#888', bg='#1a1a2e').pack(anchor='w')
         self.log_text = tk.Text(log_frame, font=('Consolas', 8), bg='#0a0a1a', fg='#44dd44',
@@ -880,32 +884,53 @@ class QueueDashboardApp:
             self._render_table()
 
     def _capture_screenshot(self):
-        """Capture only the table area (header + rows) as PNG using Win32 API."""
+        """Capture only the table (header + rows) by hiding other UI and auto-sizing window."""
+        saved_geom = None
         try:
+            saved_geom = self.root.geometry()
+
+            self.top_frame.pack_forget()
+            self.btn_frame.pack_forget()
+            self.log_frame.pack_forget()
+
+            self.root.geometry('')
+            self.root.update_idletasks()
+            self.root.update()
+            time.sleep(0.3)
+
             import ctypes
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32
             gdi32 = ctypes.windll.gdi32
 
-            hwnd = int(self.root.frame(), 16) if hasattr(self.root, 'frame') else user32.GetForegroundWindow()
+            user32.SetProcessDPIAware()
+
+            hwnd = user32.FindWindowW(None, self.root.title())
+            if not hwnd:
+                hwnd = self.root.winfo_id()
 
             rect = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            win_w = rect.right - rect.left
-            win_h = rect.bottom - rect.top
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
 
-            if win_w <= 0 or win_h <= 0:
+            self._log(f'Screenshot capture: {w}x{h}')
+
+            if w <= 0 or h <= 0:
+                self._restore_ui(saved_geom)
                 return None
 
             hdc_screen = user32.GetDC(0)
             hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, win_w, win_h)
+            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
             gdi32.SelectObject(hdc_mem, hbmp)
 
-            result = user32.PrintWindow(hwnd, hdc_mem, 2)
+            PW_RENDERFULLCONTENT = 2
+            result = user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT)
             if not result:
-                gdi32.BitBlt(hdc_mem, 0, 0, win_w, win_h, hdc_screen, rect.left, rect.top, 0x00CC0020)
+                SRCCOPY = 0x00CC0020
+                gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, rect.left, rect.top, SRCCOPY)
 
             class BITMAPINFOHEADER(ctypes.Structure):
                 _fields_ = [
@@ -919,44 +944,27 @@ class QueueDashboardApp:
 
             bi = BITMAPINFOHEADER()
             bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bi.biWidth = win_w
-            bi.biHeight = -win_h
+            bi.biWidth = w
+            bi.biHeight = -h
             bi.biPlanes = 1
             bi.biBitCount = 24
             bi.biCompression = 0
 
-            row_size = ((win_w * 3 + 3) // 4) * 4
-            img_size = row_size * win_h
+            row_size = ((w * 3 + 3) // 4) * 4
+            img_size = row_size * h
             buf = ctypes.create_string_buffer(img_size)
 
-            gdi32.GetDIBits(hdc_mem, hbmp, 0, win_h, buf, ctypes.byref(bi), 0)
+            gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bi), 0)
 
             gdi32.DeleteObject(hbmp)
             gdi32.DeleteDC(hdc_mem)
             user32.ReleaseDC(0, hdc_screen)
 
-            # Crop to just the table area (header + table rows)
-            try:
-                win_y = rect.top
-                hdr_y = self.header_frame.winfo_rooty() - win_y
-                tbl_y = self.table_canvas.winfo_rooty() - win_y
-                tbl_h = self.table_canvas.winfo_height()
-                crop_top = max(0, hdr_y)
-                crop_bottom = min(win_h, tbl_y + tbl_h)
-            except:
-                crop_top = 0
-                crop_bottom = win_h
-
-            if crop_bottom <= crop_top:
-                crop_top = 0
-                crop_bottom = win_h
-
-            w = win_w
-            h = crop_bottom - crop_top
+            self._restore_ui(saved_geom)
 
             import struct, io, zlib
             raw_rows = []
-            for y in range(crop_top, crop_bottom):
+            for y in range(h):
                 row_data = bytearray(w * 3)
                 for x in range(w):
                     offset = y * row_size + x * 3
@@ -986,8 +994,23 @@ class QueueDashboardApp:
 
             return png.getvalue()
         except Exception as e:
+            self._restore_ui(saved_geom)
             self._log(f'Screenshot failed: {e}')
+            import traceback
+            traceback.print_exc()
             return None
+
+    def _restore_ui(self, saved_geom=None):
+        """Restore all UI elements after screenshot capture."""
+        try:
+            self.top_frame.pack(fill='x', padx=10, pady=(10, 3), before=self.header_frame)
+            self.btn_frame.pack(fill='x', padx=10, pady=3, after=self.top_frame)
+            self.log_frame.pack(fill='x', padx=10, pady=(3, 10))
+            if saved_geom:
+                self.root.geometry(saved_geom)
+            self.root.update_idletasks()
+        except:
+            pass
 
     def _send_discord(self):
         name = self.discord_name_entry.get().strip()
@@ -1035,12 +1058,12 @@ class QueueDashboardApp:
                     data = body.getvalue()
                     req = urllib.request.Request(webhook, data=data, method='POST')
                     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-                    req.add_header('User-Agent', 'QueueDashboard/3.8')
+                    req.add_header('User-Agent', 'QueueDashboard/4.0')
                 else:
                     data = json.dumps({'username': f'{name} | Queue Dashboard', 'content': content}).encode()
                     req = urllib.request.Request(webhook, data=data, method='POST')
                     req.add_header('Content-Type', 'application/json')
-                    req.add_header('User-Agent', 'QueueDashboard/3.8')
+                    req.add_header('User-Agent', 'QueueDashboard/4.0')
 
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     if resp.status < 300:
