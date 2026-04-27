@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.2"
+VERSION = "4.3"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -635,73 +635,97 @@ class QueueDashboardApp:
         finally:
             self.scanning = False
 
-    def _find_active_profiles(self):
-        """Fetch all running profiles from AdsPower API with pagination."""
+    def _parse_active_list(self, lst):
+        """Parse a list of active browser entries from AdsPower API."""
         results = []
+        for p in lst:
+            uid = p.get('user_id', '')
+            serial = str(p.get('serial_number', p.get('serialnumber', '')))
+            name = p.get('name', '')
+            dp = 0
 
-        for base in [API_BASE, 'http://local.adspower.net:50325']:
-            page = 1
-            while page <= 200:
-                try:
-                    url = f'{base}/api/v1/browser/active?page={page}&page_size=100'
-                    req = urllib.request.Request(url)
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        data = json.loads(resp.read().decode())
-                except Exception as e:
-                    if page == 1:
-                        self.root.after(0, lambda ee=str(e): self._log(f'AdsPower API ({base}): {ee}'))
-                    break
+            raw_dp = p.get('debug_port', 0)
+            if raw_dp:
+                dp = int(str(raw_dp))
+            else:
+                ws = p.get('ws', {})
+                if isinstance(ws, dict):
+                    ws_url = ws.get('puppeteer', ws.get('selenium', ''))
+                    if ws_url:
+                        m = re.search(r':(\d+)/', ws_url)
+                        if m:
+                            dp = int(m.group(1))
 
-                if data.get('code') != 0:
-                    break
+            results.append({
+                'user_id': uid, 'serial': serial,
+                'name': name, 'debug_port': dp
+            })
+        return results
 
-                d = data.get('data', {})
-                lst = d.get('list', []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
-                if not lst:
-                    break
+    def _try_active_endpoint(self, base, endpoint):
+        """Try fetching running profiles from a specific API endpoint with pagination."""
+        results = []
+        page = 1
+        while page <= 200:
+            try:
+                url = f'{base}{endpoint}?page={page}&page_size=100'
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+            except:
+                return None if page == 1 else results
 
-                for p in lst:
-                    uid = p.get('user_id', '')
-                    serial = str(p.get('serial_number', p.get('serialnumber', '')))
-                    name = p.get('name', '')
-                    dp = 0
+            if data.get('code') != 0:
+                return None if page == 1 else results
 
-                    raw_dp = p.get('debug_port', 0)
-                    if raw_dp:
-                        dp = int(str(raw_dp))
-                    else:
-                        ws = p.get('ws', {})
-                        if isinstance(ws, dict):
-                            ws_url = ws.get('puppeteer', ws.get('selenium', ''))
-                            if ws_url:
-                                m = re.search(r':(\d+)/', ws_url)
-                                if m:
-                                    dp = int(m.group(1))
+            d = data.get('data', {})
+            lst = d.get('list', []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
+            if not lst:
+                break
 
-                    results.append({
-                        'user_id': uid, 'serial': serial,
-                        'name': name, 'debug_port': dp
-                    })
+            results.extend(self._parse_active_list(lst))
 
-                page_count = 1
-                if isinstance(d, dict):
-                    page_count = d.get('page_count', 1)
-                if page >= page_count:
-                    break
-                page += 1
-                time.sleep(0.2)
+            page_count = 1
+            if isinstance(d, dict):
+                page_count = d.get('page_count', 1)
+            if page >= page_count:
+                break
+            page += 1
+            time.sleep(0.2)
 
-            if results:
-                self.root.after(0, lambda c=len(results): self._log(f'AdsPower: found {c} running profiles'))
-                return results
+        return results
 
-        self.root.after(0, lambda: self._log('AdsPower API not reachable, falling back to port scan'))
+    def _find_active_profiles(self):
+        """Fetch all running profiles - tries API endpoints then falls back to port scan."""
+        endpoints = [
+            '/api/v1/browser/active',
+            '/api/v1/browser/local-active',
+        ]
+        bases = [API_BASE, 'http://local.adspower.net:50325']
+
+        for base in bases:
+            for ep in endpoints:
+                results = self._try_active_endpoint(base, ep)
+                if results:
+                    self.root.after(0, lambda c=len(results), e=ep: self._log(
+                        f'AdsPower {e}: {c} running profiles'))
+                    return results
+
+        self.root.after(0, lambda: self._log('Scanning debug ports...'))
+        results = []
         candidate_ports = find_chrome_debug_ports()
         for port in candidate_ports:
             if check_debug_port(port):
-                results.append({'user_id': '', 'serial': '', 'name': '', 'debug_port': port})
+                uid = self._get_uid_from_tabs(port)
+                results.append({'user_id': uid or '', 'serial': '', 'name': '', 'debug_port': port})
             if len(results) >= 50:
                 break
+
+        if results:
+            self._fetch_serials_bulk()
+            self.root.after(0, lambda c=len(results): self._log(f'Port scan: found {c} profiles'))
+        else:
+            self.root.after(0, lambda: self._log('No running profiles detected'))
 
         return results
 
