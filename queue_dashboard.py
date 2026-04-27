@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.4"
+VERSION = "3.5"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -333,6 +333,7 @@ class ProfileRow:
         self.queue_num = 0
         self.event = ''
         self.link = ''
+        self.link_from_cdp = False
         self.status = 'Scanning...'
         self.last_update = 0
         self.ext_keys = set()
@@ -515,17 +516,19 @@ class QueueDashboardApp:
                     profile.last_update = time.time()
                     break
 
-            for lk in lookup_keys:
-                link = link_map.get(lk)
-                if link:
-                    profile.link = str(link)
-                    break
+            if not profile.link_from_cdp:
+                for lk in lookup_keys:
+                    link = link_map.get(lk)
+                    if link:
+                        profile.link = str(link)
+                        break
 
-            for lk in lookup_keys:
-                evt = event_map.get(lk)
-                if evt:
-                    profile.event = clean_event_title(str(evt), profile.link)
-                    break
+            if not profile.link_from_cdp:
+                for lk in lookup_keys:
+                    evt = event_map.get(lk)
+                    if evt:
+                        profile.event = clean_event_title(str(evt), profile.link)
+                        break
 
         self._update_status_bar()
         self._render_table()
@@ -741,6 +744,7 @@ class QueueDashboardApp:
                     continue
 
                 profile.link = tab.get('url', '')
+                profile.link_from_cdp = True
                 profile.event = clean_event_title(tab.get('title', ''), profile.link)
 
                 result = cdp_evaluate(ws_url, QUEUE_JS)
@@ -751,6 +755,7 @@ class QueueDashboardApp:
                         if q and q > 0:
                             profile.queue_num = q
                             profile.link = data.get('u', profile.link)
+                            profile.link_from_cdp = True
                             profile.event = clean_event_title(data.get('t', ''), profile.link)
                             profile.status = 'In Queue'
                             profile.last_update = time.time()
@@ -767,6 +772,7 @@ class QueueDashboardApp:
                     best = tab
                     break
             profile.link = best.get('url', '')
+            profile.link_from_cdp = True
             profile.event = clean_event_title(best.get('title', ''), profile.link)
             profile.status = 'No TM page'
         return True
