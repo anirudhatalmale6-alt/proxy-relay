@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "3.7"
+VERSION = "3.8"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -976,11 +976,18 @@ class QueueDashboardApp:
         if not name or name == 'VA Name':
             self._log('Enter your VA Name first')
             return
-        if not webhook or webhook == 'Discord URL' or 'discord.com/api/webhooks' not in webhook:
+        if not webhook or webhook == 'Discord URL':
+            self._log('Enter a valid Discord webhook URL')
+            return
+        if 'discord.com/api/webhooks' not in webhook and 'discordapp.com/api/webhooks' not in webhook:
             self._log('Enter a valid Discord webhook URL')
             return
 
         screenshot_data = self._capture_screenshot()
+        if screenshot_data:
+            self._log(f'Screenshot captured: {len(screenshot_data)} bytes')
+        else:
+            self._log('Screenshot capture failed, sending text only')
 
         def do_send():
             ts = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -1032,10 +1039,12 @@ class QueueDashboardApp:
                     data = body.getvalue()
                     req = urllib.request.Request(webhook, data=data, method='POST')
                     req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+                    req.add_header('User-Agent', 'QueueDashboard/3.8')
                 else:
                     data = json.dumps({'username': f'{name} | Queue Dashboard', 'content': content}).encode()
                     req = urllib.request.Request(webhook, data=data, method='POST')
                     req.add_header('Content-Type', 'application/json')
+                    req.add_header('User-Agent', 'QueueDashboard/3.8')
 
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     if resp.status < 300:
@@ -1043,6 +1052,13 @@ class QueueDashboardApp:
                         self.root.after(0, lambda: self._log(msg))
                     else:
                         self.root.after(0, lambda: self._log(f'Discord error: {resp.status}'))
+            except urllib.error.HTTPError as he:
+                body = ''
+                try:
+                    body = he.read().decode('utf-8', errors='ignore')[:200]
+                except:
+                    pass
+                self.root.after(0, lambda: self._log(f'Discord error {he.code}: {body}'))
             except Exception as e:
                 self.root.after(0, lambda: self._log(f'Discord send failed: {e}'))
 
