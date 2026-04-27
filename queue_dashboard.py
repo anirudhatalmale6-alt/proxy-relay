@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.0"
+VERSION = "5.1"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -545,11 +545,24 @@ class QueueDashboardApp:
                 if profile.serial:
                     continue
                 pname = (profile.name or '').lower().strip()
+                em = re.search(r'[\w.+\-]+@[\w.\-]+\.\w{2,}', pname)
+                if em:
+                    pname = em.group(0)
                 if pname and pname in name_serial:
                     profile.serial = name_serial[pname]
                     profile.ext_keys.add('s:' + profile.serial)
                     matched += 1
-            if matched and self.push_count <= 5:
+                    continue
+                for tab_key in list(profile.ext_keys):
+                    for dn, ds in name_serial.items():
+                        if dn in pname or pname in dn:
+                            profile.serial = ds
+                            profile.ext_keys.add('s:' + ds)
+                            matched += 1
+                            break
+                    if profile.serial:
+                        break
+            if matched and self.push_count <= 10:
                 self._log(f'DOM push: matched {matched} Custom # from dashboard')
 
         if active_profiles:
@@ -802,7 +815,8 @@ class QueueDashboardApp:
             for tab in page_tabs:
                 title = tab.get('title', '')
                 if '@' in title and '.' in title:
-                    profile.name = title.strip()
+                    em = re.search(r'[\w.+\-]+@[\w.\-]+\.\w{2,}', title)
+                    profile.name = em.group(0) if em else title.strip()
                     break
 
         tm_tabs = [t for t in page_tabs if is_tm_url(t.get('url', ''))]
