@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.5"
+VERSION = "4.6"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -674,7 +674,7 @@ class QueueDashboardApp:
         return ''
 
     def _fetch_serials_bulk(self):
-        """Fetch all profiles from AdsPower API in bulk and match by user_id."""
+        """Fetch all profiles from AdsPower API and match by user_id or name."""
         all_users = []
         for base in [API_BASE, 'http://local.adspower.net:50325']:
             page = 1
@@ -687,26 +687,42 @@ class QueueDashboardApp:
                     break
                 all_users.extend(items)
                 page += 1
-                time.sleep(0.5)
+                time.sleep(0.3)
             if all_users:
                 break
 
+        if not all_users:
+            return
+
         uid_map = {}
+        name_map = {}
         for u in all_users:
             uid = str(u.get('user_id', ''))
             serial = str(u.get('serial_number', u.get('serialnumber', '')))
             name = str(u.get('name', ''))
+            info = {'serial': serial, 'name': name, 'uid': uid}
             if uid:
-                uid_map[uid] = {'serial': serial, 'name': name}
+                uid_map[uid] = info
+            if name:
+                name_map[name.lower().strip()] = info
 
         for key, profile in self.profiles.items():
+            if profile.serial:
+                continue
+
+            info = None
             if profile.uid and profile.uid in uid_map:
                 info = uid_map[profile.uid]
-                if info['serial'] and not profile.serial:
+            elif profile.name:
+                info = name_map.get(profile.name.lower().strip())
+
+            if info:
+                if info['serial']:
                     profile.serial = info['serial']
                     profile.ext_keys.add('s:' + info['serial'])
-                if info['name'] and not profile.name:
-                    profile.name = info['name']
+                if info['uid'] and not profile.uid:
+                    profile.uid = info['uid']
+                    profile.ext_keys.add('u:' + info['uid'])
 
     def _scan_profile_tabs(self, profile):
         """Scan a profile's tabs for TM queue pages. Returns False if port is dead."""
@@ -807,7 +823,7 @@ class QueueDashboardApp:
             row = tk.Frame(self.table_inner, bg=bg)
             row.pack(fill='x', pady=0)
 
-            profile_id = p.serial or p.name or str(p.debug_port)
+            profile_id = p.serial or str(p.debug_port)
             tk.Label(row, text=profile_id, font=('Consolas', 9),
                      fg='#aaa', bg=bg, width=16, anchor='w').pack(side='left', padx=1)
 
