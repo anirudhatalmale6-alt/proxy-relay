@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.1"
+VERSION = "4.2"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -559,51 +559,61 @@ class QueueDashboardApp:
 
             if need_full_scan:
                 self.last_full_scan = now
-                debug_ports = self._find_profile_ports()
-                if not debug_ports and not self.profiles:
+                active = self._find_active_profiles()
+
+                if not active and not self.profiles:
                     self.root.after(0, lambda: self.status_label.configure(
                         text=f'No profiles found | {time.strftime("%H:%M:%S")}'))
                     return
 
-                current_ports = set()
+                active_keys = set()
                 new_profiles = []
-                for port in debug_ports:
-                    current_ports.add(port)
-                    key = str(port)
-                    if key not in self.profiles:
-                        uid = self._get_uid_from_tabs(port)
-                        name = ''
-                        if uid:
-                            tabs = http_get_json(f'http://127.0.0.1:{port}/json')
-                            if tabs:
-                                for tab in tabs:
-                                    title = tab.get('title', '')
-                                    if '@' in title and '.' in title:
-                                        name = title.strip()
-                                        break
-                        self.profiles[key] = ProfileRow(port, name, '', uid)
-                        if uid:
-                            self.profiles[key].ext_keys.add('u:' + uid)
-                        new_profiles.append(key)
 
-                stale = [k for k in self.profiles if k not in [str(p) for p in current_ports]]
+                for info in active:
+                    uid = info.get('user_id', '')
+                    port = info.get('debug_port', 0)
+                    serial = info.get('serial', '')
+                    name = info.get('name', '')
+
+                    key = f'u:{uid}' if uid else str(port)
+                    active_keys.add(key)
+
+                    if key not in self.profiles:
+                        if port and not uid:
+                            uid = self._get_uid_from_tabs(port)
+
+                        p = ProfileRow(port, name, serial, uid)
+                        if uid:
+                            p.ext_keys.add('u:' + uid)
+                        if serial:
+                            p.ext_keys.add('s:' + serial)
+                        self.profiles[key] = p
+                        new_profiles.append(key)
+                    else:
+                        p = self.profiles[key]
+                        if serial and not p.serial:
+                            p.serial = serial
+                        if name and not p.name:
+                            p.name = name
+                        if port and not p.debug_port:
+                            p.debug_port = port
+
+                stale = [k for k in self.profiles if k not in active_keys]
                 for k in stale:
                     del self.profiles[k]
 
                 if new_profiles:
-                    self._fetch_serials_bulk()
                     for key in new_profiles:
                         p = self.profiles.get(key)
                         if p:
                             self.root.after(0, lambda pp=p: self._log(
-                                f'Found profile port {pp.debug_port}: #{pp.serial} ({pp.name})'))
-
-                missing_serial = [p for p in self.profiles.values() if not p.serial]
-                if missing_serial:
-                    self._fetch_serials_bulk()
+                                f'Profile: #{pp.serial} {pp.name} (port {pp.debug_port})'))
 
             dead_keys = []
             for key, profile in list(self.profiles.items()):
+                if not profile.debug_port:
+                    profile.status = 'Running'
+                    continue
                 alive = self._scan_profile_tabs(profile)
                 if alive is False:
                     dead_keys.append(key)
@@ -613,53 +623,87 @@ class QueueDashboardApp:
                 p = self.profiles.pop(k, None)
                 if p:
                     self.root.after(0, lambda pp=p: self._log(
-                        f'Profile closed: port {pp.debug_port} #{pp.serial}'))
+                        f'Profile closed: #{pp.serial}'))
 
             self.root.after(0, self._update_status_bar)
             self.root.after(0, self._render_table)
 
         except Exception as e:
             self.root.after(0, lambda: self._log(f'Scan error: {e}'))
+            import traceback
+            traceback.print_exc()
         finally:
             self.scanning = False
 
-    def _find_profile_ports(self):
-        """Find debug ports - try AdsPower API first, then scan ports directly."""
-        ports = []
+    def _find_active_profiles(self):
+        """Fetch all running profiles from AdsPower API with pagination."""
+        results = []
 
         for base in [API_BASE, 'http://local.adspower.net:50325']:
-            try:
-                req = urllib.request.Request(base + '/api/v1/browser/active?page=1&page_size=100')
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    data = json.loads(resp.read().decode())
-                if data.get('code') == 0:
-                    d = data.get('data', {})
-                    lst = d.get('list', []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
-                    for p in lst:
-                        dp = p.get('debug_port', 0)
-                        if dp:
-                            ports.append(int(str(dp)))
-                            continue
+            page = 1
+            while page <= 200:
+                try:
+                    url = f'{base}/api/v1/browser/active?page={page}&page_size=100'
+                    req = urllib.request.Request(url)
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read().decode())
+                except Exception as e:
+                    if page == 1:
+                        self.root.after(0, lambda ee=str(e): self._log(f'AdsPower API ({base}): {ee}'))
+                    break
+
+                if data.get('code') != 0:
+                    break
+
+                d = data.get('data', {})
+                lst = d.get('list', []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
+                if not lst:
+                    break
+
+                for p in lst:
+                    uid = p.get('user_id', '')
+                    serial = str(p.get('serial_number', p.get('serialnumber', '')))
+                    name = p.get('name', '')
+                    dp = 0
+
+                    raw_dp = p.get('debug_port', 0)
+                    if raw_dp:
+                        dp = int(str(raw_dp))
+                    else:
                         ws = p.get('ws', {})
                         if isinstance(ws, dict):
                             ws_url = ws.get('puppeteer', ws.get('selenium', ''))
                             if ws_url:
                                 m = re.search(r':(\d+)/', ws_url)
                                 if m:
-                                    ports.append(int(m.group(1)))
-                    if ports:
-                        return ports
-            except:
-                continue
+                                    dp = int(m.group(1))
 
+                    results.append({
+                        'user_id': uid, 'serial': serial,
+                        'name': name, 'debug_port': dp
+                    })
+
+                page_count = 1
+                if isinstance(d, dict):
+                    page_count = d.get('page_count', 1)
+                if page >= page_count:
+                    break
+                page += 1
+                time.sleep(0.2)
+
+            if results:
+                self.root.after(0, lambda c=len(results): self._log(f'AdsPower: found {c} running profiles'))
+                return results
+
+        self.root.after(0, lambda: self._log('AdsPower API not reachable, falling back to port scan'))
         candidate_ports = find_chrome_debug_ports()
         for port in candidate_ports:
             if check_debug_port(port):
-                ports.append(port)
-            if len(ports) >= 50:
+                results.append({'user_id': '', 'serial': '', 'name': '', 'debug_port': port})
+            if len(results) >= 50:
                 break
 
-        return ports
+        return results
 
     def _get_uid_from_tabs(self, debug_port):
         """Extract AdsPower user_id from start.adspower.net tab URL."""
