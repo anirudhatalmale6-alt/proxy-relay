@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.7"
+VERSION = "5.8"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -408,6 +408,7 @@ class QueueDashboardApp:
         self._last_dom_profiles = []
         self._profile_map = {}
         self._profile_map_time = 0
+        self._closed_uids = {}
         self._build_ui()
         self._load_profile_map()
         self._start_server()
@@ -692,6 +693,11 @@ class QueueDashboardApp:
                 self.last_full_scan = now
                 active = self._find_active_profiles()
 
+                self._closed_uids = {
+                    k: v for k, v in self._closed_uids.items()
+                    if now - v < 60
+                }
+
                 if not active and not self.profiles:
                     self.root.after(0, lambda: self.status_label.configure(
                         text=f'No profiles found | {time.strftime("%H:%M:%S")}'))
@@ -706,12 +712,17 @@ class QueueDashboardApp:
                     serial = info.get('serial', '')
                     name = info.get('name', '')
 
+                    if uid and uid in self._closed_uids:
+                        continue
+
                     key = f'u:{uid}' if uid else str(port)
                     active_keys.add(key)
 
                     if key not in self.profiles:
                         if port and not uid:
                             uid = self._get_uid_from_tabs(port)
+                            if uid and uid in self._closed_uids:
+                                continue
 
                         p = ProfileRow(port, name, serial, uid)
                         if uid:
@@ -1198,8 +1209,9 @@ class QueueDashboardApp:
         def do_close():
             resp = api_get(f'/api/v1/browser/stop?user_id={close_uid}')
             if resp.get('code') == 0:
+                self._closed_uids[close_uid] = time.time()
                 self.root.after(0, lambda: self._log(f'Profile #{display} closed'))
-                self.root.after(0, lambda: self._remove_profile_by_uid(close_uid))
+                self.root.after(0, lambda u=close_uid, s=serial: self._remove_profile(u, s))
             else:
                 self.root.after(0, lambda m=resp.get('msg', ''): self._log(f'Close failed: {m}'))
         threading.Thread(target=do_close, daemon=True).start()
@@ -1219,6 +1231,7 @@ class QueueDashboardApp:
                 if close_uid:
                     resp = api_get(f'/api/v1/browser/stop?user_id={close_uid}')
                     if resp.get('code') == 0:
+                        self._closed_uids[close_uid] = time.time()
                         closed += 1
                     time.sleep(0.3)
             self.root.after(0, lambda c=closed: self._log(f'Closed {c}/{count} profiles'))
@@ -1227,8 +1240,13 @@ class QueueDashboardApp:
             self.root.after(0, self._update_status_bar)
         threading.Thread(target=do_close_all, daemon=True).start()
 
-    def _remove_profile_by_uid(self, uid):
-        keys_to_remove = [k for k, p in self.profiles.items() if p.uid == uid]
+    def _remove_profile(self, uid='', serial=''):
+        keys_to_remove = []
+        for k, p in self.profiles.items():
+            if uid and p.uid == uid:
+                keys_to_remove.append(k)
+            elif serial and p.serial == serial:
+                keys_to_remove.append(k)
         for k in keys_to_remove:
             del self.profiles[k]
         if keys_to_remove:
