@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.1"
+VERSION = "5.2"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -381,6 +381,7 @@ class QueueDashboardApp:
         self.scanning = False
         self.last_full_scan = 0
         self.user_list_cache = {}
+        self._last_dom_profiles = []
         self._build_ui()
         self._start_server()
         self._check_connection_loop()
@@ -523,6 +524,36 @@ class QueueDashboardApp:
             self.conn_indicator.configure(fg='#ff4444')
         self.root.after(5000, self._check_connection_loop)
 
+    def _apply_dom_serials(self):
+        """Match DOM-scraped Custom # to profiles by email address."""
+        if not self._last_dom_profiles:
+            return
+        name_serial = {}
+        for dp in self._last_dom_profiles:
+            serial = str(dp.get('serial', ''))
+            name = str(dp.get('name', '')).lower().strip()
+            if serial and name:
+                name_serial[name] = serial
+        if not name_serial:
+            return
+        matched = 0
+        for key, profile in self.profiles.items():
+            if profile.serial:
+                continue
+            pname = (profile.name or '').lower().strip()
+            em = re.search(r'[\w.+\-]+@[\w.\-]+\.\w{2,}', pname)
+            if em:
+                pname = em.group(0)
+            if not pname or len(pname) < 5:
+                continue
+            if pname in name_serial:
+                profile.serial = name_serial[pname]
+                profile.ext_keys.add('s:' + profile.serial)
+                matched += 1
+        if matched:
+            self._log(f'Matched {matched} Custom # from dashboard')
+            self._render_table()
+
     def _handle_push(self, data):
         self.push_count += 1
         self.last_push_time = time.time()
@@ -534,36 +565,8 @@ class QueueDashboardApp:
         dom_profiles = data.get('domProfiles', [])
 
         if dom_profiles:
-            name_serial = {}
-            for dp in dom_profiles:
-                serial = str(dp.get('serial', ''))
-                name = str(dp.get('name', '')).lower().strip()
-                if serial and name:
-                    name_serial[name] = serial
-            matched = 0
-            for key, profile in self.profiles.items():
-                if profile.serial:
-                    continue
-                pname = (profile.name or '').lower().strip()
-                em = re.search(r'[\w.+\-]+@[\w.\-]+\.\w{2,}', pname)
-                if em:
-                    pname = em.group(0)
-                if pname and pname in name_serial:
-                    profile.serial = name_serial[pname]
-                    profile.ext_keys.add('s:' + profile.serial)
-                    matched += 1
-                    continue
-                for tab_key in list(profile.ext_keys):
-                    for dn, ds in name_serial.items():
-                        if dn in pname or pname in dn:
-                            profile.serial = ds
-                            profile.ext_keys.add('s:' + ds)
-                            matched += 1
-                            break
-                    if profile.serial:
-                        break
-            if matched and self.push_count <= 10:
-                self._log(f'DOM push: matched {matched} Custom # from dashboard')
+            self._last_dom_profiles = dom_profiles
+            self._apply_dom_serials()
 
         if active_profiles:
             uid_serial = {}
@@ -701,6 +704,7 @@ class QueueDashboardApp:
                     self.root.after(0, lambda pp=p: self._log(
                         f'Profile closed: #{pp.serial}'))
 
+            self.root.after(0, self._apply_dom_serials)
             self.root.after(0, self._update_status_bar)
             self.root.after(0, self._render_table)
 
@@ -877,7 +881,7 @@ class QueueDashboardApp:
             widget.destroy()
 
         sorted_profiles = sorted(self.profiles.values(),
-                                  key=lambda p: (-(p.queue_num or 999999), p.serial or str(p.debug_port)))
+                                  key=lambda p: -(int(p.serial) if p.serial and p.serial.isdigit() else 0))
 
         for idx, p in enumerate(sorted_profiles):
             bg = '#111122' if idx % 2 == 0 else '#0a0a1a'
