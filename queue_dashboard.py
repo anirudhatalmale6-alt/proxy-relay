@@ -21,7 +21,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "4.7"
+VERSION = "4.8"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -231,8 +231,8 @@ def strip_prefix(key):
 
 
 def find_chrome_debug_ports():
-    """Find Chrome/Chromium debug ports by checking listening ports via netstat."""
-    ports = set()
+    """Find Chrome/Chromium debug ports and their PIDs via netstat."""
+    port_pid = {}
     try:
         output = subprocess.check_output(
             'netstat -ano | findstr "LISTENING" | findstr "127.0.0.1"',
@@ -240,18 +240,37 @@ def find_chrome_debug_ports():
         ).decode('utf-8', errors='ignore')
         for line in output.strip().split('\n'):
             parts = line.split()
-            if len(parts) >= 2:
+            if len(parts) >= 5:
                 addr = parts[1]
+                pid = parts[4].strip()
                 if ':' in addr:
                     try:
                         port = int(addr.split(':')[-1])
                         if 10000 <= port <= 60000 and port != LISTEN_PORT and port != 50325:
-                            ports.add(port)
+                            port_pid[port] = pid
                     except:
                         pass
     except:
         pass
-    return sorted(ports)
+    return port_pid
+
+
+def get_uid_from_pid(pid):
+    """Extract AdsPower user_id from Chrome process command line via WMIC."""
+    try:
+        output = subprocess.check_output(
+            f'wmic process where "processid={pid}" get commandline /format:list',
+            shell=True, timeout=5, stderr=subprocess.DEVNULL
+        ).decode('utf-8', errors='ignore')
+        m = re.search(r'user-data-dir[=\\/"]+.*?([a-z0-9]{8,})', output, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        m = re.search(r'cache_path[=\\/"]+.*?([a-z0-9]{8,})', output, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    except:
+        pass
+    return ''
 
 
 def check_debug_port(port):
@@ -644,12 +663,14 @@ class QueueDashboardApp:
         self.root.after(0, lambda: self._log('Scanning for running profiles...'))
 
         results = []
-        candidate_ports = find_chrome_debug_ports()
-        self.root.after(0, lambda c=len(candidate_ports): self._log(f'Found {c} candidate ports'))
+        port_pid = find_chrome_debug_ports()
+        self.root.after(0, lambda c=len(port_pid): self._log(f'Found {c} candidate ports'))
 
-        for port in candidate_ports:
+        for port, pid in port_pid.items():
             if check_debug_port(port):
-                uid = self._get_uid_from_tabs(port)
+                uid = get_uid_from_pid(pid)
+                if not uid:
+                    uid = self._get_uid_from_tabs(port)
                 results.append({'user_id': uid or '', 'serial': '', 'name': '', 'debug_port': port})
             if len(results) >= 200:
                 break
