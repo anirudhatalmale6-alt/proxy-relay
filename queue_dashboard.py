@@ -16,12 +16,13 @@ import subprocess
 try:
     import urllib.request
     import urllib.error
+    import urllib.parse
 except ImportError:
     pass
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.3.1"
+VERSION = "5.4"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -742,10 +743,12 @@ class QueueDashboardApp:
                     self.root.after(0, lambda pp=p: self._log(
                         f'Profile closed: #{pp.serial}'))
 
-            missing = [p for p in self.profiles.values()
-                       if not p.serial and p.uid]
+            missing = [p for p in self.profiles.values() if not p.serial]
             for p in missing:
-                self._fetch_serial_for_profile(p, log=True)
+                if p.uid:
+                    self._fetch_serial_for_profile(p, log=True)
+                if not p.serial and p.name:
+                    self._fetch_serial_by_email(p)
                 time.sleep(0.1)
 
             self.root.after(0, self._apply_dom_serials)
@@ -835,12 +838,45 @@ class QueueDashboardApp:
                 self.root.after(0, lambda uid=profile.uid, m=msg:
                     self._log(f'API lookup failed for {uid}: {m}'))
 
+    def _fetch_serial_by_email(self, profile):
+        """Look up serial by searching the API with the profile's email/name."""
+        email = self._extract_email(profile.name)
+        if not email or len(email) < 5:
+            return
+        encoded = urllib.parse.quote(email, safe='')
+        for base in [API_BASE, 'http://local.adspower.net:50325']:
+            r = http_get_json(f'{base}/api/v1/user/list?page_size=10&user_name={encoded}', timeout=5)
+            if not r or r.get('code') != 0:
+                r = http_get_json(f'{base}/api/v1/user/list?page_size=10&name={encoded}', timeout=5)
+            if r and r.get('code') == 0:
+                items = r.get('data', {}).get('list', [])
+                for u in items:
+                    uname = str(u.get('name', '')).lower().strip()
+                    if email in uname or uname == email:
+                        serial = str(
+                            u.get('serial_number', '')
+                            or u.get('serialnumber', '')
+                            or u.get('custom_user_id', '')
+                        )
+                        uid = str(u.get('user_id', ''))
+                        if serial:
+                            profile.serial = serial
+                            profile.ext_keys.add('s:' + serial)
+                            if uid:
+                                profile.uid = uid
+                                profile.ext_keys.add('u:' + uid)
+                            self.root.after(0, lambda s=serial, e=email:
+                                self._log(f'API: {e} → Custom #{s}'))
+                            return
+
     def _fetch_serials_bulk(self):
         """Look up serial numbers for all profiles that don't have one yet."""
         for key, profile in list(self.profiles.items()):
             if profile.serial:
                 continue
             self._fetch_serial_for_profile(profile)
+            if not profile.serial:
+                self._fetch_serial_by_email(profile)
             time.sleep(0.1)
 
     def _scan_profile_tabs(self, profile):
