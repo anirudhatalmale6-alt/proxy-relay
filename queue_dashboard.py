@@ -1,5 +1,5 @@
 """
-AdsPower Queue Dashboard v5.13
+AdsPower Queue Dashboard v5.14
 Scans for Chrome debug ports, evaluates queue JS via CDP.
 Profile map cache: fetches ALL profiles from AdsPower API on startup,
 builds uid/email/name -> Custom# mapping, cached to profile_map.json.
@@ -26,7 +26,7 @@ except ImportError:
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-VERSION = "5.13"
+VERSION = "5.14"
 API_BASE = "http://127.0.0.1:50325"
 LISTEN_PORT = 12345
 SCAN_INTERVAL = 4
@@ -1254,25 +1254,47 @@ class QueueDashboardApp:
             return self._profile_map.get(f'serial:{serial}', '')
         return ''
 
-    def _stop_profile_browser(self, close_uid, debug_port=0, stored_pid=''):
-        """Stop a profile's browser. Tries API first, then kills the process."""
-        for base in [API_BASE, 'http://local.adspower.net:50325']:
-            r = http_get_json(f'{base}/api/v1/browser/stop?user_id={close_uid}', timeout=10)
-            if r and r.get('code') == 0:
-                return 'api'
+    def _stop_profile_browser(self, close_uid, debug_port=0, stored_pid='', serial=''):
+        """Stop a profile's browser. Tries API with multiple uid sources, then kills process."""
+        uids_to_try = []
+        if close_uid:
+            uids_to_try.append(close_uid)
+        if serial and self._profile_map:
+            map_uid = self._profile_map.get(f'serial:{serial}', '')
+            if map_uid and map_uid not in uids_to_try:
+                uids_to_try.append(map_uid)
+
+        for uid in uids_to_try:
+            for base in [API_BASE, 'http://local.adspower.net:50325']:
+                self._log(f'Trying API stop: {base} uid={uid}')
+                r = http_get_json(f'{base}/api/v1/browser/stop?user_id={uid}', timeout=10)
+                if r and r.get('code') == 0:
+                    self._log(f'API stop success for uid={uid}')
+                    return 'api'
+                if r:
+                    self._log(f'API stop response: {r}')
 
         pid = stored_pid or ''
         if not pid and debug_port:
             pid = self._find_pid_for_port(debug_port)
         if pid:
+            self._log(f'Trying taskkill PID={pid}')
             try:
                 subprocess.check_output(
                     f'taskkill /PID {pid} /F /T',
                     shell=True, timeout=10, stderr=subprocess.DEVNULL
                 )
+                time.sleep(1)
+                for uid in uids_to_try:
+                    for base in [API_BASE, 'http://local.adspower.net:50325']:
+                        r = http_get_json(f'{base}/api/v1/browser/stop?user_id={uid}', timeout=10)
+                        if r and r.get('code') == 0:
+                            self._log(f'API stop after kill success for uid={uid}')
+                            return 'api+kill'
                 return 'kill'
-            except:
-                pass
+            except Exception as e:
+                self._log(f'taskkill failed: {e}')
+        self._log(f'Stop failed: no uid or pid (uid={close_uid}, pid={stored_pid})')
         return ''
 
     def _find_pid_for_port(self, port):
@@ -1300,7 +1322,7 @@ class QueueDashboardApp:
             return
 
         def do_close():
-            method = self._stop_profile_browser(close_uid, debug_port, stored_pid)
+            method = self._stop_profile_browser(close_uid, debug_port, stored_pid, serial)
             if close_uid:
                 self._closed_uids[close_uid] = time.time()
             if method:
@@ -1324,7 +1346,7 @@ class QueueDashboardApp:
             closed = 0
             for key, profile in list(self.profiles.items()):
                 close_uid = self._resolve_uid(profile.uid, profile.serial)
-                method = self._stop_profile_browser(close_uid, profile.debug_port, profile.pid)
+                method = self._stop_profile_browser(close_uid, profile.debug_port, profile.pid, profile.serial)
                 if close_uid:
                     self._closed_uids[close_uid] = time.time()
                 if method:
